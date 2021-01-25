@@ -18,6 +18,7 @@ def load_pics(*names):
         image = np.array(pil_image)
         # image = plt.imread(str(name))
 
+
 def load_all_pics(train_pics_names):
     count = 0
     images = [None] * 15000
@@ -51,25 +52,42 @@ def load_all_pics(train_pics_names):
     # train_pics = image_dataset_from_directory(dataset_root+'/train')
     # train_pics_gen = ImageDataGenerator
 
-...
-
-
-def main():
-    # Load the datasets metadata in dataframes
-    dataset_root = '/mnt/storage/datasets/vinbigdata'
-    train = pd.read_csv(Path(dataset_root + '/train.csv'))
-    test = pd.read_csv(Path(dataset_root + '/test.csv'))
-    train_pics_names = list(Path(dataset_root + '/train').glob('*.jpg'))
-
-    # Find images that appear the most often in the training metadata
-
 
 
 
 # Press the green button in the gutter to run the script.
 if __name__ == '__main__':
-    main()
+    # Load the datasets metadata in dataframes
+    dataset_root = '/mnt/storage/datasets/vinbigdata'
+    train = pd.read_csv(Path(dataset_root + '/train.csv'))
+    test = pd.read_csv(Path(dataset_root + '/test.csv'))  # This is for the Kaggle competition, no GT available
+    # train_pics_names = list(Path(dataset_root + '/train').glob('*.jpg'))
 
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/
+    """ Process the dataset to assign, to each x-ray, one or more diagnosis, based on a majority vote among the 
+    radiologists. If at least 2 radiologists out of 3 have given a same diagnosis to a given x-ray, then the 
+    diagnosis is assigned to the given x-ray. If at least 2 radiologists out of 2 have assigned 'no finding' to the
+    x-ray, then the x-ray is assigned 'no finding'. As a consequence, each x-ray is either assigned 'no finding', or
+    one or more diagnosis. """
+    grouped = train.groupby(['image_id', 'class_id'])['rad_id'].value_counts()
+    images_ids = train.image_id.value_counts().index
+    n_samples = len(images_ids)
+    diagnosis = np.zeros((n_samples, 15), dtype=int)
+    for ((image_id, class_id, rad_id), _) in grouped.iteritems():
+        diagnosis[images_ids.get_loc(image_id), class_id] += 1
+    diagnosis = (diagnosis >= 2).astype(int)
 
-#TODO provare a caricare le immagini fingendo sia un dataset anche se non lo e', vedere se e' piu' veloce
+    # Sanity check
+    count = 0
+    for line in diagnosis:
+        # sum(line[:14]) > 0 => line[-1]==0
+        assert (sum(line[:14]) == 0 or line[-1] == 0)
+        assert ((line[-1] == 0 and sum(line[:14]) >= 0) or (line[-1] == 1 and sum(line[:14]) == 0))
+        count += 1
+
+    # Convert the obtained metadata to a dataframe
+    dataset = pd.DataFrame(diagnosis)
+    dataset['image_id'] = images_ids
+    # Shuffle the rows of the dataframe (samples)
+    dataset = dataset.sample(frac=1)
+    
+
