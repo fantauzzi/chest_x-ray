@@ -1,7 +1,6 @@
 import pandas as pd
 import tensorflow as tf
 from pathlib import Path
-from tensorflow.keras.preprocessing import image_dataset_from_directory
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -12,6 +11,8 @@ from sklearn.model_selection import train_test_split
 from math import ceil
 from tensorflow.keras.layers import Dense
 from tensorflow.keras.models import Model
+import datetime
+import tqdm
 
 
 def load_pics(*names):
@@ -56,8 +57,23 @@ def load_all_pics(train_pics_names):
     # train_pics_gen = ImageDataGenerator
 
 
+def load_all_images(file_names, dir, resolution):
+    images = np.zeros(shape=(len(file_names), resolution[0], resolution[1]), dtype=np.uint8)
+    mapping = {}
+    for i in tqdm.trange(len(file_names)):
+        name = file_names.iloc[i]
+        pil_image = Image.open(dir+'/'+name)
+        pil_image = pil_image.resize(resolution, resample=3)
+        image = np.array(pil_image, dtype=np.uint8)
+        images[i] = image
+        mapping[name] = i
+    return images, mapping
+
+
+
 # Press the green button in the gutter to run the script.
 if __name__ == '__main__':
+    input_res = (224, 224)
     # Load the datasets metadata in dataframes
     dataset_root = '/mnt/storage/datasets/vinbigdata'
     train = pd.read_csv(Path(dataset_root + '/train.csv'))
@@ -93,7 +109,10 @@ if __name__ == '__main__':
     dataset = pd.DataFrame(diagnosis)
     dataset['image_id'] = images_ids + '.jpg'
     # Shuffle the rows of the dataframe (samples)
-    dataset = dataset.sample(frac=1, random_state=42)
+    # dataset = dataset.sample(frac=1, random_state=42)
+    # dataset = dataset[:32]
+    dataset = dataset.sample(n=32, random_state=42)
+    images, image_name_to_row = load_all_images(dataset['image_id'], dir=dataset_root+'/train', resolution=input_res)
 
     ''' Split the dataset into training, validation and test set; validation and test set contain the same number of 
     samples '''
@@ -123,7 +142,7 @@ if __name__ == '__main__':
         # train_batch_size = 32
         generator = img_gen.flow_from_dataframe(dataframe=dataframe,
                                                 directory=dataset_root + '/train',
-                                                target_size=(512, 512),
+                                                target_size=input_res,
                                                 # color_mode='grayscale',
                                                 x_col='image_id',
                                                 y_col=list(range(15)),
@@ -161,14 +180,14 @@ if __name__ == '__main__':
     pre_trained = tf.keras.applications.EfficientNetB5(include_top=False,
                                                        weights='imagenet',
                                                        input_tensor=None,
-                                                       input_shape=(512, 512, 3),
+                                                       input_shape=input_res+(3,),
                                                        pooling='avg')
 
     predictions = Dense(15, activation='sigmoid')(pre_trained.output)
 
     model = Model(inputs=pre_trained.input, outputs=predictions)
-    for layer in model.layers[:577]:
-        layer.trainable = False
+    # for layer in model.layers[:len(model.layers)-1]:
+    #    layer.trainable = False
     model.summary()
     print('\nTrainable layers:')
     for layer in model.layers:
@@ -177,7 +196,7 @@ if __name__ == '__main__':
     print()
 
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(),  # Consider others, e.g. RMSprop
+        optimizer=tf.keras.optimizers.RMSprop(),  # Consider others, e.g. RMSprop
         loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
         metrics=[tf.keras.metrics.BinaryAccuracy(name='binary_accuracy'), tf.keras.metrics.Precision(name='precision'),
                  tf.keras.metrics.Recall(name='recall'),
@@ -185,12 +204,12 @@ if __name__ == '__main__':
 
     train_generator = make_generator(dataframe=dataset_train,
                                      preprocessing_function=preprocess_train,
-                                     batch_size=32,
+                                     batch_size=16,
                                      shuffle=True)
 
     val_generator = make_generator(dataframe=dataset_val,
                                    preprocessing_function=preprocess_train,
-                                   batch_size=32,
+                                   batch_size=16,
                                    shuffle=True)
 
     steps_per_train_epoch = ceil(train_generator.samples / train_generator.batch_size)
@@ -202,11 +221,16 @@ if __name__ == '__main__':
     print(
         f'{steps_per_val_epoch} batches, of {val_generator.batch_size} samples each, per validation epoch; with an odd batch of size {last_batch_val_size}.')
 
+    log_dir = 'logs/' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1)
+
     history = model.fit(train_generator,
-                        epochs=4,
+                        epochs=100,
                         steps_per_epoch=steps_per_train_epoch,
                         validation_data=val_generator,
                         validation_steps=steps_per_val_epoch,
                         # class_weight=class_weight,
-                        # callbacks=callbacks,
+                        callbacks=[tensorboard_callback],
                         verbose=1)
+
+    # TODO: continue with loading all images in memory experimenting with a small dataset
