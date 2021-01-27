@@ -31,6 +31,7 @@ def load_images(file_names, dir, resolution, pickle_file=None):
 
     for i in tqdm.trange(len(file_names)):
         name = file_names.iloc[i]
+        # TODO try with matplotlib and tf.image.resize()
         pil_image = Image.open(dir + '/' + name)
         pil_image = pil_image.resize(resolution, resample=3)
         image = np.array(pil_image, dtype=np.uint8)
@@ -45,11 +46,15 @@ def load_images(file_names, dir, resolution, pickle_file=None):
         return images
 
 
-# Press the green button in the gutter to run the script.
 if __name__ == '__main__':
-    input_res = (224, 224)
+    ''' For input resolution, check here, based on the choice of EfficientNet:
+     https://keras.io/examples/vision/image_classification_efficientnet_fine_tuning/ '''
+    input_res = (300, 300)
     train_batch_size = 16
     val_batch_size = 16
+    limit_samples = None
+    print(
+        f'Input resolution {input_res}\nTraining batch size {train_batch_size}\nValidation batch size {val_batch_size}')
     # Load the datasets metadata in dataframes
     dataset_root = '/mnt/storage/datasets/vinbigdata'
     metadata = pd.read_csv(Path(dataset_root + '/train.csv'))
@@ -86,7 +91,10 @@ if __name__ == '__main__':
     # Shuffle the rows of the dataframe (samples)
     # dataset = dataset[:32]
     # y_df = y_df.sample(n=64, random_state=42)
-    y_df = y_df.sample(frac=1, random_state=42)
+    if limit_samples is None:
+        y_df = y_df.sample(frac=1, random_state=42)
+    else:
+        y_df = y_df.sample(n=limit_samples, random_state=42)
     y_df.reset_index(inplace=True, drop=True)
 
     ''' Split the dataset into training, validation and test set; validation and test set contain the same number of 
@@ -104,23 +112,33 @@ if __name__ == '__main__':
     images_train = load_images(y_train['image_id'], dir=dataset_root + '/train', resolution=input_res,
                                pickle_file='logs/train_images.pickle')
     y_train.drop(columns=['image_id'], inplace=True)
-    dataset_train = tf.data.Dataset.from_tensor_slices((images_train, y_train))
+    # dataset_train = tf.data.Dataset.from_tensor_slices((images_train, y_train))
 
 
     def preprocess_sample(image, y):
-        image = tf.dtypes.cast(image, tf.float32) / 255.
-        # image = tf.repeat(image, repeats=3, axis=0)
+        # TODO: move this at the bacth level for efficiency
+        # image = tf.dtypes.cast(image, tf.float32) / 255.
+        ''' Note: the Keras pre-trained EfficientNet normalizes the images itself, assumes the input images are encoded
+        in the range [0, 255] '''
         image = tf.stack([image, image, image], axis=2)
         return image, y
 
 
-    dataset_train = dataset_train.shuffle(buffer_size=len(y_train), seed=42, reshuffle_each_iteration=True)
-    dataset_train = dataset_train.map(preprocess_sample)
+    def make_pipeline(x, y, batch_size, shuffle):
+        dataset = tf.data.Dataset.from_tensor_slices((x, y))
+        if shuffle:
+            dataset = dataset.shuffle(buffer_size=len(y_train), seed=42, reshuffle_each_iteration=True)
+        dataset = dataset.map(preprocess_sample)
+        dataset = dataset.batch(batch_size=batch_size, drop_remainder=False)
+        dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+        return dataset
+
+
 
     # Show a couple images from the generator, along with their GT, as a sanity check
     n_cols = 4
     n_rows = ceil(16 / n_cols)
-    dataset_samples = dataset_train.batch(n_cols * n_rows, drop_remainder=False)
+    dataset_samples = make_pipeline(x=images_train, y=y_train, batch_size=n_cols*n_rows, shuffle=True)
     samples_iter = iter(dataset_samples)
     samples = next(samples_iter)
     fig, axs = plt.subplots(n_rows, n_cols, figsize=(9.45, 4 * n_rows), dpi=109.28)
@@ -139,14 +157,17 @@ if __name__ == '__main__':
     plt.draw()
     plt.pause(.01)
 
-    pre_trained = tf.keras.applications.EfficientNetB5(include_top=False,
+    # For regularization try setting drop_connect_rate here below
+    pre_trained = tf.keras.applications.EfficientNetB3(include_top=False,
                                                        weights='imagenet',
                                                        input_tensor=None,
                                                        input_shape=input_res + (3,),
                                                        pooling='avg')
 
+    # TODO: double-check: sigmoid and not softmax because multiple categories are possible
     predictions = Dense(15, activation='sigmoid')(pre_trained.output)
 
+    # TODO consider adding here batch normalization and then drop-out
     model = Model(inputs=pre_trained.input, outputs=predictions)
     # for layer in model.layers[:len(model.layers)-1]:
     #    layer.trainable = False
@@ -158,30 +179,31 @@ if __name__ == '__main__':
     print()
 
     model.compile(
-        optimizer=tf.keras.optimizers.RMSprop(),  # Consider others, e.g. RMSprop
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-2),
         loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
         metrics=[tf.keras.metrics.BinaryAccuracy(name='binary_accuracy'), tf.keras.metrics.Precision(name='precision'),
                  tf.keras.metrics.Recall(name='recall'),
                  tf.keras.metrics.AUC(name='auc')])
 
-    dataset_train = dataset_train.batch(batch_size=train_batch_size, drop_remainder=False)
     images_val = load_images(y_val['image_id'], dir=dataset_root + '/train', resolution=input_res,
                              pickle_file='logs/val_images.pickle')
     y_val.drop(columns=['image_id'], inplace=True)
-    dataset_val = tf.data.Dataset.from_tensor_slices((images_val, y_val))
-    dataset_val = dataset_val.map(preprocess_sample)
-    dataset_val = dataset_val.batch(batch_size=val_batch_size, drop_remainder=False)
 
     log_dir = 'logs/' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    print(f'\nLogging in directory {log_dir}')
     tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1)
 
+    dataset_train = make_pipeline(x=images_train, y=y_train, batch_size=train_batch_size, shuffle=True)
+    dataset_val = make_pipeline(x=images_val, y=y_val, batch_size=val_batch_size, shuffle=True)
+
     history = model.fit(dataset_train,
-                        epochs=4,
-                        # steps_per_epoch=steps_per_train_epoch,
+                        epochs=200,
                         validation_data=dataset_val,
-                        # validation_steps=steps_per_val_epoch,
                         # class_weight=class_weight,
                         shuffle=False,  # Shuffling is already done on the dataset before it is being fed to fit()
                         callbacks=[tensorboard_callback],
                         verbose=1)
 
+    ''' TODO: 
+    revert to the smallest model B0 for quick test
+    consider two stages fine tuning, as per https://keras.io/guides/transfer_learning/ '''
