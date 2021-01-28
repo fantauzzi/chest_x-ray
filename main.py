@@ -49,10 +49,13 @@ def load_images(file_names, dir, resolution, pickle_file=None):
 if __name__ == '__main__':
     ''' For input resolution, check here, based on the choice of EfficientNet:
      https://keras.io/examples/vision/image_classification_efficientnet_fine_tuning/ '''
-    input_res = (300, 300)
-    train_batch_size = 16
+    input_res = (224, 224)
+    train_batch_size = 8
     val_batch_size = 16
-    limit_samples = None
+    limit_samples = 32
+    epochs = 50  # Number of epochs to run with the base network frozen (for transfer learning)
+    epochs_ft = 100  # Number of epochs to run for fine-tuning
+    model_choice = tf.keras.applications.EfficientNetB0
     print(
         f'Input resolution {input_res}\nTraining batch size {train_batch_size}\nValidation batch size {val_batch_size}')
     # Load the datasets metadata in dataframes
@@ -77,6 +80,12 @@ if __name__ == '__main__':
     # If for any sample there is no consensus on any diagnosis, then set 'no finding' to 1 for that sample
     y[y.sum(axis=1) == 0, 14] = 1
 
+    y_zeros_count = (1-y).sum(axis=0)
+    samples_weight = np.dot(y, y_zeros_count)
+    samples_weight = samples_weight/(15*len(y))
+
+
+
     # Sanity check
     count = 0
     for line in y:
@@ -88,9 +97,8 @@ if __name__ == '__main__':
     # Convert the obtained ground truth to a dataframe, and add a column with the image file names
     y_df = pd.DataFrame(y)
     y_df['image_id'] = images_ids + '.jpg'
+    y_df['weights'] = samples_weight
     # Shuffle the rows of the dataframe (samples)
-    # dataset = dataset[:32]
-    # y_df = y_df.sample(n=64, random_state=42)
     if limit_samples is None:
         y_df = y_df.sample(frac=1, random_state=42)
     else:
@@ -104,28 +112,30 @@ if __name__ == '__main__':
     y_train_val, y_test = train_test_split(y_df, test_size=p_test, random_state=42, stratify=y_df[14])
     stratify_train_val = y_df[14].loc[y_train_val[14].index]
     y_train, y_val = train_test_split(y_train_val, test_size=p_val, random_state=42, stratify=stratify_train_val)
+
     # sanity check
     assert len(y_train) + len(y_test) + len(y_val) == len(y_df)
-    assert (y_train.sum(numeric_only=True) + y_test.sum(numeric_only=True) + y_val.sum(
-        numeric_only=True)).equals(y_df.sum(numeric_only=True))
+    # assert (y_train.sum(numeric_only=True) + y_test.sum(numeric_only=True) + y_val.sum(
+    #     numeric_only=True)).equals(y_df.sum(numeric_only=True))
 
+    # Load all the images of the training dataset and store the in memory, for visualization and training
     images_train = load_images(y_train['image_id'], dir=dataset_root + '/train', resolution=input_res,
                                pickle_file='logs/train_images.pickle')
-    y_train.drop(columns=['image_id'], inplace=True)
-    # dataset_train = tf.data.Dataset.from_tensor_slices((images_train, y_train))
+    weights = y_train['weights']
+    y_train.drop(columns=['image_id', 'weights'], inplace=True)
 
 
-    def preprocess_sample(image, y):
+    def preprocess_sample(image, y, weight=None):
         # TODO: move this at the bacth level for efficiency
-        # image = tf.dtypes.cast(image, tf.float32) / 255.
         ''' Note: the Keras pre-trained EfficientNet normalizes the images itself, assumes the input images are encoded
         in the range [0, 255] '''
+        # Turn grayscale images into 3 channel images, as that is what the model expects as input
         image = tf.stack([image, image, image], axis=2)
-        return image, y
+        return (image, y) if weight is None else (image, y, weight)
 
 
-    def make_pipeline(x, y, batch_size, shuffle):
-        dataset = tf.data.Dataset.from_tensor_slices((x, y))
+    def make_pipeline(x, y, weights, batch_size, shuffle):
+        dataset = tf.data.Dataset.from_tensor_slices((x, y)) if weights is None else tf.data.Dataset.from_tensor_slices((x, y, weights))
         if shuffle:
             dataset = dataset.shuffle(buffer_size=len(y_train), seed=42, reshuffle_each_iteration=True)
         dataset = dataset.map(preprocess_sample)
@@ -134,11 +144,10 @@ if __name__ == '__main__':
         return dataset
 
 
-
-    # Show a couple images from the generator, along with their GT, as a sanity check
+    # Show a couple images from a pipeline, along with their GT, as a sanity check
     n_cols = 4
     n_rows = ceil(16 / n_cols)
-    dataset_samples = make_pipeline(x=images_train, y=y_train, batch_size=n_cols*n_rows, shuffle=True)
+    dataset_samples = make_pipeline(x=images_train, y=y_train, weights=None, batch_size=n_cols * n_rows, shuffle=True)
     samples_iter = iter(dataset_samples)
     samples = next(samples_iter)
     fig, axs = plt.subplots(n_rows, n_cols, figsize=(9.45, 4 * n_rows), dpi=109.28)
@@ -157,53 +166,97 @@ if __name__ == '__main__':
     plt.draw()
     plt.pause(.01)
 
-    # For regularization try setting drop_connect_rate here below
-    pre_trained = tf.keras.applications.EfficientNetB3(include_top=False,
-                                                       weights='imagenet',
-                                                       input_tensor=None,
-                                                       input_shape=input_res + (3,),
-                                                       pooling='avg')
+    # Instantiate the base model (pre-trained) for transfer learning
+    # For additional regularization, try setting drop_connect_rate here below
+    inputs = tf.keras.layers.Input(shape=input_res + (3,))
+    pre_trained = model_choice(input_tensor=inputs,
+                               input_shape=input_res + (3,),
+                               weights='imagenet',
+                               include_top=False,
+                               pooling='avg')
 
+    # Freeze the weights in the base model, to use it for transfer learning
+    pre_trained.trainable = False
+
+    # Append a final classification layer at the end of the base model (this will be trainable)
     # TODO: double-check: sigmoid and not softmax because multiple categories are possible
-    predictions = Dense(15, activation='sigmoid')(pre_trained.output)
-
+    x = pre_trained(inputs)
     # TODO consider adding here batch normalization and then drop-out
-    model = Model(inputs=pre_trained.input, outputs=predictions)
-    # for layer in model.layers[:len(model.layers)-1]:
-    #    layer.trainable = False
+    # x = tf.keras.layers.Dropout(.2, name="top_dropout")(x)
+    outputs = Dense(15, activation='sigmoid')(x)
+
+    model = Model(inputs=inputs, outputs=outputs)
+
     model.summary()
-    print('\nTrainable layers:')
-    for layer in model.layers:
-        if layer.trainable:
-            print(layer.name, layer)
+
+
+    def print_trainable_layers(model):
+        print('\nTrainable layers:')
+        count = 0
+        for layer in model.layers:
+            if layer.trainable:
+                print(layer.name)
+                count += 1
+        print(f'{count} out of {len(model.layers)} layers are trainable')
+
+
+    print_trainable_layers(model)
     print()
 
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-2),
-        loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
-        metrics=[tf.keras.metrics.BinaryAccuracy(name='binary_accuracy'), tf.keras.metrics.Precision(name='precision'),
-                 tf.keras.metrics.Recall(name='recall'),
-                 tf.keras.metrics.AUC(name='auc')])
+
+    def compile_model():
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=.5e-2),
+            loss=tf.keras.losses.BinaryCrossentropy(from_logits=False),
+            metrics=[tf.keras.metrics.BinaryAccuracy(name='binary_accuracy'),
+                     tf.keras.metrics.Precision(name='precision'),
+                     tf.keras.metrics.Recall(name='recall'),
+                     tf.keras.metrics.AUC(name='auc')])
+
+
+    compile_model()
 
     images_val = load_images(y_val['image_id'], dir=dataset_root + '/train', resolution=input_res,
                              pickle_file='logs/val_images.pickle')
-    y_val.drop(columns=['image_id'], inplace=True)
+    y_val.drop(columns=['image_id', 'weights'], inplace=True)
 
     log_dir = 'logs/' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     print(f'\nLogging in directory {log_dir}')
     tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1)
 
-    dataset_train = make_pipeline(x=images_train, y=y_train, batch_size=train_batch_size, shuffle=True)
-    dataset_val = make_pipeline(x=images_val, y=y_val, batch_size=val_batch_size, shuffle=True)
+    dataset_train = make_pipeline(x=images_train, y=y_train, weights=weights, batch_size=train_batch_size, shuffle=True)
+    dataset_val = make_pipeline(x=images_val, y=y_val, weights=None, batch_size=val_batch_size, shuffle=True)
 
     history = model.fit(dataset_train,
-                        epochs=200,
+                        epochs=epochs,
                         validation_data=dataset_val,
                         # class_weight=class_weight,
                         shuffle=False,  # Shuffling is already done on the dataset before it is being fed to fit()
                         callbacks=[tensorboard_callback],
                         verbose=1)
 
+    # Un-freeze the weights of the base model to fine tune. Also see https://bit.ly/2YnJwqg
+    print('\nFine-tuning the model.')
+    pre_trained.trainable = True
+
+    print_trainable_layers(model)
+    print()
+
+    # Because of the change in frozen layers, need to recompile the model
+    compile_model()
+
+    log_dir_ft = 'logs/' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    print(f'\nLogging in directory {log_dir_ft}')
+    tensorboard_callback_ft = tf.keras.callbacks.TensorBoard(log_dir=log_dir_ft, histogram_freq=1)
+
+    history_ft = model.fit(dataset_train,
+                           epochs=epochs_ft,
+                           validation_data=dataset_val,
+                           shuffle=False,  # Shuffling is already done on the dataset before it is being fed to fit()
+                           callbacks=[tensorboard_callback_ft],
+                           verbose=1)
+
     ''' TODO: 
-    revert to the smallest model B0 for quick test
-    consider two stages fine tuning, as per https://keras.io/guides/transfer_learning/ '''
+    Two stages fine tuning, as per https://keras.io/guides/transfer_learning/ 
+    Initialize last bias properly
+    Weighted loss for imbalanced dataset'''
