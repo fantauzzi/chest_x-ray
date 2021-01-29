@@ -50,9 +50,9 @@ if __name__ == '__main__':
     ''' For input resolution, check here, based on the choice of EfficientNet:
      https://keras.io/examples/vision/image_classification_efficientnet_fine_tuning/ '''
     input_res = (224, 224)
-    train_batch_size = 8
+    train_batch_size = 16
     val_batch_size = 16
-    limit_samples = 32
+    limit_samples = None
     epochs = 50  # Number of epochs to run with the base network frozen (for transfer learning)
     epochs_ft = 100  # Number of epochs to run for fine-tuning
     model_choice = tf.keras.applications.EfficientNetB0
@@ -80,11 +80,9 @@ if __name__ == '__main__':
     # If for any sample there is no consensus on any diagnosis, then set 'no finding' to 1 for that sample
     y[y.sum(axis=1) == 0, 14] = 1
 
-    y_zeros_count = (1-y).sum(axis=0)
+    y_zeros_count = (1 - y).sum(axis=0)
     samples_weight = np.dot(y, y_zeros_count)
-    samples_weight = samples_weight/(15*len(y))
-
-
+    samples_weight = samples_weight / (15 * len(y))
 
     # Sanity check
     count = 0
@@ -135,7 +133,8 @@ if __name__ == '__main__':
 
 
     def make_pipeline(x, y, weights, batch_size, shuffle):
-        dataset = tf.data.Dataset.from_tensor_slices((x, y)) if weights is None else tf.data.Dataset.from_tensor_slices((x, y, weights))
+        dataset = tf.data.Dataset.from_tensor_slices((x, y)) if weights is None else tf.data.Dataset.from_tensor_slices(
+            (x, y, weights))
         if shuffle:
             dataset = dataset.shuffle(buffer_size=len(y_train), seed=42, reshuffle_each_iteration=True)
         dataset = dataset.map(preprocess_sample)
@@ -188,6 +187,7 @@ if __name__ == '__main__':
     model = Model(inputs=inputs, outputs=outputs)
 
     model.summary()
+    pre_trained.summary()
 
 
     def print_trainable_layers(model):
@@ -204,7 +204,7 @@ if __name__ == '__main__':
     print()
 
 
-    def compile_model():
+    def compile_model(model):
         model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=.5e-2),
             loss=tf.keras.losses.BinaryCrossentropy(from_logits=False),
@@ -212,9 +212,10 @@ if __name__ == '__main__':
                      tf.keras.metrics.Precision(name='precision'),
                      tf.keras.metrics.Recall(name='recall'),
                      tf.keras.metrics.AUC(name='auc')])
+        return model
 
 
-    compile_model()
+    model = compile_model(model)
 
     images_val = load_images(y_val['image_id'], dir=dataset_root + '/train', resolution=input_res,
                              pickle_file='logs/val_images.pickle')
@@ -226,6 +227,31 @@ if __name__ == '__main__':
 
     dataset_train = make_pipeline(x=images_train, y=y_train, weights=weights, batch_size=train_batch_size, shuffle=True)
     dataset_val = make_pipeline(x=images_val, y=y_val, weights=None, batch_size=val_batch_size, shuffle=True)
+
+
+    # pre_trained.layers[2].adapt(dataset_train)
+
+    def compute_normalization_params(dataset):
+        batch_iter = iter(dataset)
+        total_mean = tf.Variable((0, 0, 0), dtype=tf.float32)
+        total_variance = tf.Variable((0, 0, 0), dtype=tf.float32)
+        batches_count = 0
+        for batch in batch_iter:
+            mean = tf.math.reduce_mean(tf.cast(batch[0], dtype=tf.float32) / 255., axis=[0, 1, 2])
+            variance = tf.math.reduce_variance(tf.cast(batch[0], dtype=tf.float32) / 255., axis=[0, 1, 2])
+            total_mean.assign_add(mean)
+            total_variance.assign_add(variance)
+            batches_count += 1
+        total_mean.assign(total_mean/batches_count)
+        total_variance.assign(total_variance/ batches_count)
+        return total_mean, total_variance
+
+
+    mean, variance = compute_normalization_params(dataset_train)
+    print(f'\nComputed mean {mean} and variance {variance} for the training dataset.')
+    pre_trained.layers[2].mean.assign(mean)
+    pre_trained.layers[2].variance.assign(variance)
+
 
     history = model.fit(dataset_train,
                         epochs=epochs,
@@ -243,7 +269,7 @@ if __name__ == '__main__':
     print()
 
     # Because of the change in frozen layers, need to recompile the model
-    compile_model()
+    model = compile_model(model)
 
     log_dir_ft = 'logs/' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     print(f'\nLogging in directory {log_dir_ft}')
