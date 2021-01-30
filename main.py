@@ -13,15 +13,14 @@ import tqdm
 import pickle
 
 
-def load_images(file_names, dir, resolution, pickle_file=None):
-    # pickle_file= 'logs/images.pickle'
+def load_images(file_names, resolution, n_classes, dir, pickle_file=None):
     images = np.zeros(shape=(len(file_names), resolution[0], resolution[1]), dtype=np.uint8)
     if pickle_file is not None and Path(pickle_file).is_file():
         print(f'\nReading pickled images from file {pickle_file}')
         with open(pickle_file, 'rb') as the_file:
             from_pickle = pickle.load(the_file)
         if not from_pickle['file_names'].equals(file_names) or from_pickle['dir'] != dir or from_pickle[
-            'resolution'] != resolution:
+            'resolution'] != resolution or n_classes!=from_pickle['n_classes']:
             print(
                 f'Data in pickle file {pickle_file} don\'t match data that are needed. To rebuild the pickle file, delete it and re-run the program')
             exit(-1)
@@ -38,7 +37,7 @@ def load_images(file_names, dir, resolution, pickle_file=None):
         images[i] = image
 
     if pickle_file is not None:
-        pickle_this = {'file_names': file_names, 'dir': dir, 'resolution': resolution, 'images': images}
+        pickle_this = {'file_names': file_names, 'dir': dir, 'resolution': resolution, 'images': images, 'n_classes': n_classes}
         print(f'\nPickling images in file {pickle_file}')
         with open(pickle_file, 'wb') as pickle_file:
             pickle.dump(pickle_this, pickle_file, pickle.HIGHEST_PROTOCOL)
@@ -50,12 +49,16 @@ if __name__ == '__main__':
     ''' For input resolution, check here, based on the choice of EfficientNet:
      https://keras.io/examples/vision/image_classification_efficientnet_fine_tuning/ '''
     input_res = (224, 224)
+    n_classes = 3  # Samples will be classified among the n_variables most frequent classes in the dataset
     train_batch_size = 16
     val_batch_size = 16
+    ''' The number of samples from the dataset to be used for training, validation and test of the model. Set to None
+    to use all of the available samples. Used to make quick experiments on a small subset of the datasert '''
     limit_samples = None
-    epochs = 50  # Number of epochs to run with the base network frozen (for transfer learning)
+    epochs = 25  # Number of epochs to run with the base network frozen (for transfer learning)
     epochs_ft = 100  # Number of epochs to run for fine-tuning
     model_choice = tf.keras.applications.EfficientNetB0
+
     print(
         f'Input resolution {input_res}\nTraining batch size {train_batch_size}\nValidation batch size {val_batch_size}')
     # Load the datasets metadata in dataframes
@@ -71,7 +74,9 @@ if __name__ == '__main__':
     grouped = metadata.groupby(['image_id', 'class_id'])['rad_id'].value_counts()
     images_ids = pd.Index(metadata['image_id'].unique())  # Using a pd.Index to speed-up look-up of values
     n_samples = len(images_ids)
-    y = np.zeros((n_samples, 15), dtype=int)  # The ground truth, i.e. the diagnosis for every x-ray image
+    y = np.zeros((n_samples, 15),
+                 dtype=int)  # The ground truth, i.e. the diagnosis for every x-ray image    y_df['weights'] = samples_weight
+
     for ((image_id, class_id, rad_id), _) in grouped.iteritems():
         y[images_ids.get_loc(image_id), class_id] += 1
 
@@ -80,9 +85,9 @@ if __name__ == '__main__':
     # If for any sample there is no consensus on any diagnosis, then set 'no finding' to 1 for that sample
     y[y.sum(axis=1) == 0, 14] = 1
 
-    y_zeros_count = (1 - y).sum(axis=0)
-    samples_weight = np.dot(y, y_zeros_count)
-    samples_weight = samples_weight / (15 * len(y))
+    # Sort classes based on their frequency in the dataset, ascending order; but leave out the class meaning 'no finding'
+    y_ones_count = y.sum(axis=0)
+    classes_by_freq = np.argsort(y_ones_count[:14])
 
     # Sanity check
     count = 0
@@ -92,11 +97,44 @@ if __name__ == '__main__':
         assert ((line[-1] == 0 and sum(line[:14]) >= 0) or (line[-1] == 1 and sum(line[:14]) == 0))
         count += 1
 
+    """
+    y = np.delete(y, classes_by_freq[:len(classes_by_freq) - n_classes], axis=1)
+    # Compute the samples weight
+    y[:,-1] = np.array(y[:,:n_classes].sum(axis=1)==0, dtype=np.int)
+    y_zeros_count = (1 - y).sum(axis=0)
+    samples_weight = np.dot(y, y_zeros_count)
+    samples_weight = samples_weight / ((n_classes+1) * len(y))
+    y = np.delete(y, -1, axis=1)
+    """
+
     # Convert the obtained ground truth to a dataframe, and add a column with the image file names
     y_df = pd.DataFrame(y)
+
+    # Remove columns related to classes that won't be used
+    y_df.drop(classes_by_freq[:len(classes_by_freq) - n_classes], axis=1, inplace=True)
+
+    ''' Rebuild the column for class 14, i.e. 'no finding': if the sample doesn't belong to any of the classes, then
+    ensure it belongs to class 14 '''
+    y_df.drop(14, axis=1, inplace=True)
+    y_df[14] = pd.Series(y_df.sum(axis=1) == 0, dtype=int)
+
+    # Compute sample weights, and add them as a new column to the dataframe
+    totals = y_df.sum(axis=0)
+    totals = totals.multiply(-1)
+    totals = totals.add(len(y_df))
+    samples_weights = y_df.dot(totals)
+    samples_weights = pd.Series(samples_weights.divide((n_classes + 1) * len(y_df)), dtype=float)
+    y_df['weights'] = samples_weights
+
+    # Now drop the column for class 14, 'no findig', as it is not needed anymore
+    # y_df.drop(14, axis=1, inplace=True)
+    # y_df.rename(mapper=lambda label: classes_by_freq[-(label+1)], inplace=True, axis=1)
+    # y_df.drop(classes_by_freq[:len(classes_by_freq)- n_classes], inplace=True)
+
     y_df['image_id'] = images_ids + '.jpg'
-    y_df['weights'] = samples_weight
+    # y_df['weights'] = samples_weight
     # Shuffle the rows of the dataframe (samples)
+
     if limit_samples is None:
         y_df = y_df.sample(frac=1, random_state=42)
     else:
@@ -109,7 +147,11 @@ if __name__ == '__main__':
     p_val = p_test / (1 - p_test)  # Proportion of the dataset non used for test to be used for validation
     y_train_val, y_test = train_test_split(y_df, test_size=p_test, random_state=42, stratify=y_df[14])
     stratify_train_val = y_df[14].loc[y_train_val[14].index]
-    y_train, y_val = train_test_split(y_train_val, test_size=p_val, random_state=42, stratify=stratify_train_val)
+    y_train, y_val = train_test_split(y_train_val, test_size=p_val, random_state=42, stratify=y_train_val[14])
+    # Now drop the column for class 14, 'no findig', as it is not needed anymore
+    y_train = y_train.drop(14, axis=1)
+    y_val = y_val.drop(14, axis=1)
+    y_test = y_test.drop(14, axis=1)
 
     # sanity check
     assert len(y_train) + len(y_test) + len(y_val) == len(y_df)
@@ -117,7 +159,10 @@ if __name__ == '__main__':
     #     numeric_only=True)).equals(y_df.sum(numeric_only=True))
 
     # Load all the images of the training dataset and store the in memory, for visualization and training
-    images_train = load_images(y_train['image_id'], dir=dataset_root + '/train', resolution=input_res,
+    images_train = load_images(y_train['image_id'],
+                               resolution=input_res,
+                               n_classes = n_classes,
+                               dir=dataset_root + '/train',
                                pickle_file='logs/train_images.pickle')
     weights = y_train['weights']
     y_train.drop(columns=['image_id', 'weights'], inplace=True)
@@ -182,7 +227,7 @@ if __name__ == '__main__':
     x = pre_trained(inputs)
     # TODO consider adding here batch normalization and then drop-out
     # x = tf.keras.layers.Dropout(.2, name="top_dropout")(x)
-    outputs = Dense(15, activation='sigmoid')(x)
+    outputs = Dense(n_classes, activation='sigmoid')(x)
 
     model = Model(inputs=inputs, outputs=outputs)
 
@@ -204,20 +249,23 @@ if __name__ == '__main__':
     print()
 
 
-    def compile_model(model):
+    def compile_model(model, learning_rate):
         model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=.5e-2),
+            optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
             loss=tf.keras.losses.BinaryCrossentropy(from_logits=False),
             metrics=[tf.keras.metrics.BinaryAccuracy(name='binary_accuracy'),
                      tf.keras.metrics.Precision(name='precision'),
                      tf.keras.metrics.Recall(name='recall'),
-                     tf.keras.metrics.AUC(name='auc')])
+                     tf.keras.metrics.AUC(multi_label=True, name='auc')])
         return model
 
 
-    model = compile_model(model)
+    model = compile_model(model, learning_rate=3e-4)
 
-    images_val = load_images(y_val['image_id'], dir=dataset_root + '/train', resolution=input_res,
+    images_val = load_images(y_val['image_id'],
+                             resolution=input_res,
+                             n_classes= n_classes,
+                             dir=dataset_root + '/train',
                              pickle_file='logs/val_images.pickle')
     y_val.drop(columns=['image_id', 'weights'], inplace=True)
 
@@ -242,8 +290,8 @@ if __name__ == '__main__':
             total_mean.assign_add(mean)
             total_variance.assign_add(variance)
             batches_count += 1
-        total_mean.assign(total_mean/batches_count)
-        total_variance.assign(total_variance/ batches_count)
+        total_mean.assign(total_mean / batches_count)
+        total_variance.assign(total_variance / batches_count)
         return total_mean, total_variance
 
 
@@ -251,7 +299,6 @@ if __name__ == '__main__':
     print(f'\nComputed mean {mean} and variance {variance} for the training dataset.')
     pre_trained.layers[2].mean.assign(mean)
     pre_trained.layers[2].variance.assign(variance)
-
 
     history = model.fit(dataset_train,
                         epochs=epochs,
@@ -269,7 +316,7 @@ if __name__ == '__main__':
     print()
 
     # Because of the change in frozen layers, need to recompile the model
-    model = compile_model(model)
+    model = compile_model(model,learning_rate=3e-5)
 
     log_dir_ft = 'logs/' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     print(f'\nLogging in directory {log_dir_ft}')
@@ -282,7 +329,7 @@ if __name__ == '__main__':
                            callbacks=[tensorboard_callback_ft],
                            verbose=1)
 
-    ''' TODO: 
-    Two stages fine tuning, as per https://keras.io/guides/transfer_learning/ 
+    ''' TODO:
+    Try to simplify doing single class classification, possibly also detection 
     Initialize last bias properly
-    Weighted loss for imbalanced dataset'''
+    '''
