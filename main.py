@@ -20,7 +20,7 @@ def load_images(file_names, resolution, n_classes, dir, pickle_file=None):
         with open(pickle_file, 'rb') as the_file:
             from_pickle = pickle.load(the_file)
         if not from_pickle['file_names'].equals(file_names) or from_pickle['dir'] != dir or from_pickle[
-            'resolution'] != resolution or n_classes!=from_pickle['n_classes']:
+            'resolution'] != resolution or n_classes != from_pickle['n_classes']:
             print(
                 f'Data in pickle file {pickle_file} don\'t match data that are needed. To rebuild the pickle file, delete it and re-run the program')
             exit(-1)
@@ -37,7 +37,8 @@ def load_images(file_names, resolution, n_classes, dir, pickle_file=None):
         images[i] = image
 
     if pickle_file is not None:
-        pickle_this = {'file_names': file_names, 'dir': dir, 'resolution': resolution, 'images': images, 'n_classes': n_classes}
+        pickle_this = {'file_names': file_names, 'dir': dir, 'resolution': resolution, 'images': images,
+                       'n_classes': n_classes}
         print(f'\nPickling images in file {pickle_file}')
         with open(pickle_file, 'wb') as pickle_file:
             pickle.dump(pickle_this, pickle_file, pickle.HIGHEST_PROTOCOL)
@@ -97,16 +98,6 @@ if __name__ == '__main__':
         assert ((line[-1] == 0 and sum(line[:14]) >= 0) or (line[-1] == 1 and sum(line[:14]) == 0))
         count += 1
 
-    """
-    y = np.delete(y, classes_by_freq[:len(classes_by_freq) - n_classes], axis=1)
-    # Compute the samples weight
-    y[:,-1] = np.array(y[:,:n_classes].sum(axis=1)==0, dtype=np.int)
-    y_zeros_count = (1 - y).sum(axis=0)
-    samples_weight = np.dot(y, y_zeros_count)
-    samples_weight = samples_weight / ((n_classes+1) * len(y))
-    y = np.delete(y, -1, axis=1)
-    """
-
     # Convert the obtained ground truth to a dataframe, and add a column with the image file names
     y_df = pd.DataFrame(y)
 
@@ -126,15 +117,10 @@ if __name__ == '__main__':
     samples_weights = pd.Series(samples_weights.divide((n_classes + 1) * len(y_df)), dtype=float)
     y_df['weights'] = samples_weights
 
-    # Now drop the column for class 14, 'no findig', as it is not needed anymore
-    # y_df.drop(14, axis=1, inplace=True)
-    # y_df.rename(mapper=lambda label: classes_by_freq[-(label+1)], inplace=True, axis=1)
-    # y_df.drop(classes_by_freq[:len(classes_by_freq)- n_classes], inplace=True)
-
+    # Add a column with the image file name
     y_df['image_id'] = images_ids + '.jpg'
-    # y_df['weights'] = samples_weight
-    # Shuffle the rows of the dataframe (samples)
 
+    # Limit the size of the dataset if required (variable `limit_samples`) and shuffle it.
     if limit_samples is None:
         y_df = y_df.sample(frac=1, random_state=42)
     else:
@@ -144,10 +130,11 @@ if __name__ == '__main__':
     ''' Split the dataset into training, validation and test set; validation and test set contain the same number of 
     samples '''
     p_test = .15  # Proportion of the dataset to be used as test set
-    p_val = p_test / (1 - p_test)  # Proportion of the dataset non used for test to be used for validation
+    p_val = p_test / (1 - p_test)  # Proportion of the dataset not used for test to be used for validation
     y_train_val, y_test = train_test_split(y_df, test_size=p_test, random_state=42, stratify=y_df[14])
     stratify_train_val = y_df[14].loc[y_train_val[14].index]
     y_train, y_val = train_test_split(y_train_val, test_size=p_val, random_state=42, stratify=y_train_val[14])
+
     # Now drop the column for class 14, 'no findig', as it is not needed anymore
     y_train = y_train.drop(14, axis=1)
     y_val = y_val.drop(14, axis=1)
@@ -155,15 +142,15 @@ if __name__ == '__main__':
 
     # sanity check
     assert len(y_train) + len(y_test) + len(y_val) == len(y_df)
-    # assert (y_train.sum(numeric_only=True) + y_test.sum(numeric_only=True) + y_val.sum(
-    #     numeric_only=True)).equals(y_df.sum(numeric_only=True))
 
-    # Load all the images of the training dataset and store the in memory, for visualization and training
+    # Load all the images of the training dataset and store them in memory, for visualization and training
     images_train = load_images(y_train['image_id'],
                                resolution=input_res,
-                               n_classes = n_classes,
+                               n_classes=n_classes,
                                dir=dataset_root + '/train',
                                pickle_file='logs/train_images.pickle')
+
+    # File names of images are not needed in the dataframe anymore, drop them. Also, pop the series with weights from it
     weights = y_train['weights']
     y_train.drop(columns=['image_id', 'weights'], inplace=True)
 
@@ -223,10 +210,8 @@ if __name__ == '__main__':
     pre_trained.trainable = False
 
     # Append a final classification layer at the end of the base model (this will be trainable)
-    # TODO: double-check: sigmoid and not softmax because multiple categories are possible
     x = pre_trained(inputs)
     # TODO consider adding here batch normalization and then drop-out
-    # x = tf.keras.layers.Dropout(.2, name="top_dropout")(x)
     outputs = Dense(n_classes, activation='sigmoid')(x)
 
     model = Model(inputs=inputs, outputs=outputs)
@@ -264,7 +249,7 @@ if __name__ == '__main__':
 
     images_val = load_images(y_val['image_id'],
                              resolution=input_res,
-                             n_classes= n_classes,
+                             n_classes=n_classes,
                              dir=dataset_root + '/train',
                              pickle_file='logs/val_images.pickle')
     y_val.drop(columns=['image_id', 'weights'], inplace=True)
@@ -276,8 +261,6 @@ if __name__ == '__main__':
     dataset_train = make_pipeline(x=images_train, y=y_train, weights=weights, batch_size=train_batch_size, shuffle=True)
     dataset_val = make_pipeline(x=images_val, y=y_val, weights=None, batch_size=val_batch_size, shuffle=True)
 
-
-    # pre_trained.layers[2].adapt(dataset_train)
 
     def compute_normalization_params(dataset):
         batch_iter = iter(dataset)
@@ -316,7 +299,7 @@ if __name__ == '__main__':
     print()
 
     # Because of the change in frozen layers, need to recompile the model
-    model = compile_model(model,learning_rate=3e-5)
+    model = compile_model(model, learning_rate=3e-5)
 
     log_dir_ft = 'logs/' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     print(f'\nLogging in directory {log_dir_ft}')
@@ -330,6 +313,10 @@ if __name__ == '__main__':
                            verbose=1)
 
     ''' TODO:
-    Try to simplify doing single class classification, possibly also detection 
     Initialize last bias properly
+    Maximize images dynamic range
+    Image augmentation
+    Deeper final classifier
+    Take pre-processing at batch level
+    Try to simplify doing single class classification, possibly also detection 
     '''
