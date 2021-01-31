@@ -50,7 +50,7 @@ if __name__ == '__main__':
     ''' For input resolution, check here, based on the choice of EfficientNet:
      https://keras.io/examples/vision/image_classification_efficientnet_fine_tuning/ '''
     input_res = (224, 224)
-    n_classes = 3  # Samples will be classified among the n_variables most frequent classes in the dataset
+    n_classes = 1  # Samples will be classified among the n_variables most frequent classes in the dataset
     train_batch_size = 16
     val_batch_size = 16
     ''' The number of samples from the dataset to be used for training, validation and test of the model. Set to None
@@ -212,7 +212,9 @@ if __name__ == '__main__':
     # Append a final classification layer at the end of the base model (this will be trainable)
     x = pre_trained(inputs)
     # TODO consider adding here batch normalization and then drop-out
-    outputs = Dense(n_classes, activation='sigmoid')(x)
+    y_train_freq = y_train.sum(axis=0) / len(y_train)
+    bias_init = np.log(y_train_freq / (1 - y_train_freq)).to_numpy()
+    outputs = Dense(n_classes, activation='sigmoid', bias_initializer=tf.keras.initializers.Constant(bias_init))(x)
 
     model = Model(inputs=inputs, outputs=outputs)
 
@@ -313,7 +315,6 @@ if __name__ == '__main__':
                            verbose=1)
 
     ''' TODO:
-    Initialize last bias properly
     Maximize images dynamic range
     Image augmentation
     Deeper final classifier
