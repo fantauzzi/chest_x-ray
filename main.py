@@ -46,18 +46,18 @@ def load_images(file_names, resolution, n_classes, dir, pickle_file=None):
         return images
 
 
-if __name__ == '__main__':
+def main():
     ''' For input resolution, check here, based on the choice of EfficientNet:
      https://keras.io/examples/vision/image_classification_efficientnet_fine_tuning/ '''
     input_res = (224, 224)
     n_classes = 1  # Samples will be classified among the n_variables most frequent classes in the dataset
-    train_batch_size = 16
+    train_batch_size = 8
     val_batch_size = 16
     ''' The number of samples from the dataset to be used for training, validation and test of the model. Set to None
     to use all of the available samples. Used to make quick experiments on a small subset of the datasert '''
-    limit_samples = None
+    limit_samples = 32
     epochs = 25  # Number of epochs to run with the base network frozen (for transfer learning)
-    epochs_ft = 100  # Number of epochs to run for fine-tuning
+    epochs_ft = 200  # Number of epochs to run for fine-tuning
     model_choice = tf.keras.applications.EfficientNetB0
 
     print(
@@ -99,61 +99,64 @@ if __name__ == '__main__':
         count += 1
 
     # Convert the obtained ground truth to a dataframe, and add a column with the image file names
-    y_df = pd.DataFrame(y)
+    metadata_df = pd.DataFrame(y)
 
     # Remove columns related to classes that won't be used
-    y_df.drop(classes_by_freq[:len(classes_by_freq) - n_classes], axis=1, inplace=True)
+    metadata_df.drop(classes_by_freq[:len(classes_by_freq) - n_classes], axis=1, inplace=True)
 
     ''' Rebuild the column for class 14, i.e. 'no finding': if the sample doesn't belong to any of the classes, then
     ensure it belongs to class 14 '''
-    y_df.drop(14, axis=1, inplace=True)
-    y_df[14] = pd.Series(y_df.sum(axis=1) == 0, dtype=int)
+    metadata_df.drop(14, axis=1, inplace=True)
+    # Store the labels for the columns corresponding to dataset variables, will be used for training
+    variable_labels = metadata_df.columns
+    metadata_df[14] = pd.Series(metadata_df.sum(axis=1) == 0, dtype=int)
 
     # Compute sample weights, and add them as a new column to the dataframe
-    totals = y_df.sum(axis=0)
+    totals = metadata_df.sum(axis=0)
     totals = totals.multiply(-1)
-    totals = totals.add(len(y_df))
-    samples_weights = y_df.dot(totals)
-    samples_weights = pd.Series(samples_weights.divide((n_classes + 1) * len(y_df)), dtype=float)
-    y_df['weights'] = samples_weights
+    totals = totals.add(len(metadata_df))
+    samples_weights = metadata_df.dot(totals)
+    samples_weights = pd.Series(samples_weights.divide((n_classes + 1) * len(metadata_df)), dtype=float)
+    metadata_df['weights'] = samples_weights
 
     # Add a column with the image file name
-    y_df['image_id'] = images_ids + '.jpg'
+    metadata_df['image_id'] = dataset_root + '/train/' + images_ids + '.jpg'
 
     # Limit the size of the dataset if required (variable `limit_samples`) and shuffle it.
     if limit_samples is None:
-        y_df = y_df.sample(frac=1, random_state=42)
+        metadata_df = metadata_df.sample(frac=1, random_state=42)
     else:
-        y_df = y_df.sample(n=limit_samples, random_state=42)
-    y_df.reset_index(inplace=True, drop=True)
+        metadata_df = metadata_df.sample(n=limit_samples, random_state=42)
+    metadata_df.reset_index(inplace=True, drop=True)
 
     ''' Split the dataset into training, validation and test set; validation and test set contain the same number of 
     samples '''
     p_test = .15  # Proportion of the dataset to be used as test set
     p_val = p_test / (1 - p_test)  # Proportion of the dataset not used for test to be used for validation
-    y_train_val, y_test = train_test_split(y_df, test_size=p_test, random_state=42, stratify=y_df[14])
-    stratify_train_val = y_df[14].loc[y_train_val[14].index]
-    y_train, y_val = train_test_split(y_train_val, test_size=p_val, random_state=42, stratify=y_train_val[14])
+    metadata_train_val, metadata_test = train_test_split(metadata_df, test_size=p_test, random_state=42,
+                                                         stratify=metadata_df[14])
+    # stratify_train_val = y_df[14].loc[y_train_val[14].index]
+    metadata_train, metadata_val = train_test_split(metadata_train_val, test_size=p_val, random_state=42,
+                                                    stratify=metadata_train_val[14])
 
     # Now drop the column for class 14, 'no findig', as it is not needed anymore
-    y_train = y_train.drop(14, axis=1)
-    y_val = y_val.drop(14, axis=1)
-    y_test = y_test.drop(14, axis=1)
+    metadata_train = metadata_train.drop(14, axis=1)
+    metadata_val = metadata_val.drop(14, axis=1)
+    metadata_test = metadata_test.drop(14, axis=1)
 
     # sanity check
-    assert len(y_train) + len(y_test) + len(y_val) == len(y_df)
+    assert len(metadata_train) + len(metadata_test) + len(metadata_val) == len(metadata_df)
 
     # Load all the images of the training dataset and store them in memory, for visualization and training
-    images_train = load_images(y_train['image_id'],
+    """images_train = load_images(y_train['image_id'],
                                resolution=input_res,
                                n_classes=n_classes,
                                dir=dataset_root + '/train',
-                               pickle_file='logs/train_images.pickle')
+                               pickle_file='logs/train_images.pickle')"""
 
     # File names of images are not needed in the dataframe anymore, drop them. Also, pop the series with weights from it
-    weights = y_train['weights']
-    y_train.drop(columns=['image_id', 'weights'], inplace=True)
-
+    # weights = y_train['weights']
+    # y_train.drop(columns=['image_id', 'weights'], inplace=True)
 
     def preprocess_sample(image, y, weight=None):
         # TODO: move this at the bacth level for efficiency
@@ -163,37 +166,55 @@ if __name__ == '__main__':
         image = tf.stack([image, image, image], axis=2)
         return (image, y) if weight is None else (image, y, weight)
 
+    def load_image(x, y, weight=None):
+        # tf.print(x, output_stream=sys.stdout)
+        image = tf.io.read_file(x)
+        image = tf.io.decode_jpeg(image)
+        image = tf.image.resize(image, size=input_res, method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
+        image = tf.image.grayscale_to_rgb(image)
+        return (image, x, y) if weight is None else (image, x, y, weight)
 
-    def make_pipeline(x, y, weights, batch_size, shuffle):
+    def make_pipeline(x, y, weights, batch_size, shuffle, for_model):
         dataset = tf.data.Dataset.from_tensor_slices((x, y)) if weights is None else tf.data.Dataset.from_tensor_slices(
             (x, y, weights))
         if shuffle:
-            dataset = dataset.shuffle(buffer_size=len(y_train), seed=42, reshuffle_each_iteration=True)
-        dataset = dataset.map(preprocess_sample)
+            dataset = dataset.shuffle(buffer_size=len(y), seed=42, reshuffle_each_iteration=True)
+        dataset = dataset.map(load_image, num_parallel_calls=tf.data.AUTOTUNE)
+        # If the dataset is meant to be fed to a model (for training or inference) then strip the information on the file name
+        if for_model:
+            dataset = dataset.map(lambda *sample: (sample[0], sample[2]),
+                                  num_parallel_calls=tf.data.AUTOTUNE) if weights is None else \
+                dataset.map(lambda *sample: (sample[0], sample[2], sample[3]), num_parallel_calls=tf.data.AUTOTUNE)
         dataset = dataset.batch(batch_size=batch_size, drop_remainder=False)
-        dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+        dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
         return dataset
-
 
     # Show a couple images from a pipeline, along with their GT, as a sanity check
     n_cols = 4
     n_rows = ceil(16 / n_cols)
-    dataset_samples = make_pipeline(x=images_train, y=y_train, weights=None, batch_size=n_cols * n_rows, shuffle=True)
+    dataset_samples = make_pipeline(x=metadata_train['image_id'],
+                                    y=metadata_train[variable_labels],
+                                    weights=None,
+                                    batch_size=n_cols * n_rows,
+                                    shuffle=True,
+                                    for_model=False)
     samples_iter = iter(dataset_samples)
     samples = next(samples_iter)
-    fig, axs = plt.subplots(n_rows, n_cols, figsize=(9.45, 4 * n_rows), dpi=109.28)
+    fig, axs = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 * n_rows), dpi=109.28)
     idx = 0
     for row in range(n_rows):
         for col in range(n_cols):
             axs[row, col].imshow(samples[0][idx], cmap='gray')
-            label = ''
-            for pos in range(len(samples[1][idx])):
-                if samples[1][idx][pos] == 1:
-                    label = label + str(pos) + ' '
+            x_label = Path(str(samples[1][idx])).stem
+            y_label = ''
+            for pos in range(samples[2].shape[1]):
+                if samples[2][idx][pos] == 1:
+                    y_label = y_label + str(variable_labels[pos]) + ' '
             idx += 1
             axs[row, col].set_xticks([])
             axs[row, col].set_yticks([])
-            axs[row, col].set_xlabel(label)
+            axs[row, col].set_xlabel(x_label)
+            axs[row, col].set_ylabel(y_label)
     plt.draw()
     plt.pause(.01)
 
@@ -212,7 +233,7 @@ if __name__ == '__main__':
     # Append a final classification layer at the end of the base model (this will be trainable)
     x = pre_trained(inputs)
     # TODO consider adding here batch normalization and then drop-out
-    y_train_freq = y_train.sum(axis=0) / len(y_train)
+    y_train_freq = metadata_train[variable_labels].sum(axis=0) / len(metadata_train)
     bias_init = np.log(y_train_freq / (1 - y_train_freq)).to_numpy()
     outputs = Dense(n_classes, activation='sigmoid', bias_initializer=tf.keras.initializers.Constant(bias_init))(x)
 
@@ -220,7 +241,6 @@ if __name__ == '__main__':
 
     model.summary()
     pre_trained.summary()
-
 
     def print_trainable_layers(model):
         print('\nTrainable layers:')
@@ -231,10 +251,8 @@ if __name__ == '__main__':
                 count += 1
         print(f'{count} out of {len(model.layers)} layers are trainable')
 
-
     print_trainable_layers(model)
     print()
-
 
     def compile_model(model, learning_rate):
         model.compile(
@@ -246,49 +264,85 @@ if __name__ == '__main__':
                      tf.keras.metrics.AUC(multi_label=True, name='auc')])
         return model
 
-
     model = compile_model(model, learning_rate=3e-4)
 
-    images_val = load_images(y_val['image_id'],
+    """images_val = load_images(metadata_val['image_id'],
                              resolution=input_res,
                              n_classes=n_classes,
                              dir=dataset_root + '/train',
-                             pickle_file='logs/val_images.pickle')
-    y_val.drop(columns=['image_id', 'weights'], inplace=True)
+                             pickle_file='logs/val_images.pickle')"""
+    # metadata_val.drop(columns=['image_id', 'weights'], inplace=True)
 
     log_dir = 'logs/' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     print(f'\nLogging in directory {log_dir}')
     tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1)
 
-    dataset_train = make_pipeline(x=images_train, y=y_train, weights=weights, batch_size=train_batch_size, shuffle=True)
-    dataset_val = make_pipeline(x=images_val, y=y_val, weights=None, batch_size=val_batch_size, shuffle=True)
-
+    dataset_train = make_pipeline(x=metadata_train['image_id'],
+                                  y=metadata_train[variable_labels],
+                                  weights=metadata_train['weights'],
+                                  batch_size=train_batch_size,
+                                  shuffle=True,
+                                  for_model=True)
+    dataset_val = make_pipeline(x=metadata_val['image_id'],
+                                y=metadata_val[variable_labels],
+                                weights=None,
+                                batch_size=val_batch_size,
+                                shuffle=True,
+                                for_model=True)
 
     def compute_normalization_params(dataset):
+        # TODO: this computation is an approximation, consider to replace it with an exact one
         batch_iter = iter(dataset)
         total_mean = tf.Variable((0, 0, 0), dtype=tf.float32)
         total_variance = tf.Variable((0, 0, 0), dtype=tf.float32)
         batches_count = 0
+        samples_count = 0
         for batch in batch_iter:
-            mean = tf.math.reduce_mean(tf.cast(batch[0], dtype=tf.float32) / 255., axis=[0, 1, 2])
-            variance = tf.math.reduce_variance(tf.cast(batch[0], dtype=tf.float32) / 255., axis=[0, 1, 2])
+            this_batch_size = batch[0].shape[0]
+            mean = tf.math.reduce_mean(tf.cast(batch[0], dtype=tf.float32) / 255., axis=[0, 1, 2]) * this_batch_size
+            variance = tf.math.reduce_variance(tf.cast(batch[0], dtype=tf.float32) / 255., axis=[0, 1, 2]) * this_batch_size
             total_mean.assign_add(mean)
             total_variance.assign_add(variance)
             batches_count += 1
-        total_mean.assign(total_mean / batches_count)
-        total_variance.assign(total_variance / batches_count)
+            samples_count += this_batch_size
+        total_mean.assign(total_mean / samples_count)
+        total_variance.assign(total_variance / samples_count)
         return total_mean, total_variance
 
+    def display_by_batch(dataset):
+        batch_iter = iter(dataset)
+        batches_count = 0
+        batch_size = -1
+        for batch in batch_iter:
+            batch_size = max([batch_size, batch[0].shape[0]])
+            batches_count += 1
+        fig, axs = plt.subplots(batches_count, batch_size, figsize=(2 * batch_size, 2 * batches_count), dpi=109.28)
+        batch_iter = iter(dataset)
+        for i_batch, batch in enumerate(batch_iter):
+            this_batch_size = batch[0].shape[0]
+            for i_sample in range(batch_size):
+                if i_sample < this_batch_size:
+                    image = batch[0][i_sample]
+                    gt = batch[1][i_sample].numpy()
+                    weight = batch[2][i_sample].numpy()
+                    axs[i_batch, i_sample].imshow(image)
+                    x_label = str(gt) + ' ' + str(np.around(weight, 5))
+                    axs[i_batch, i_sample].set_xlabel(x_label)
+                axs[i_batch, i_sample].set_xticks([])
+                axs[i_batch, i_sample].set_yticks([])
+        plt.draw()
+        plt.pause(.01)
 
     mean, variance = compute_normalization_params(dataset_train)
     print(f'\nComputed mean {mean} and variance {variance} for the training dataset.')
     pre_trained.layers[2].mean.assign(mean)
     pre_trained.layers[2].variance.assign(variance)
 
+    # display_by_batch(dataset_train)
+
     history = model.fit(dataset_train,
                         epochs=epochs,
                         validation_data=dataset_val,
-                        # class_weight=class_weight,
                         shuffle=False,  # Shuffling is already done on the dataset before it is being fed to fit()
                         callbacks=[tensorboard_callback],
                         verbose=1)
@@ -314,10 +368,14 @@ if __name__ == '__main__':
                            callbacks=[tensorboard_callback_ft],
                            verbose=1)
 
-    ''' TODO:
-    Maximize images dynamic range
-    Image augmentation
-    Deeper final classifier
-    Take pre-processing at batch level
-    Try to simplify doing single class classification, possibly also detection 
-    '''
+
+if __name__ == '__main__':
+    main()
+
+''' TODO:
+Maximize images dynamic range
+Image augmentation
+Deeper final classifier
+Take pre-processing at batch level
+Try to simplify doing single class classification, possibly also detection 
+'''
