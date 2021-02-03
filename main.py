@@ -1,15 +1,15 @@
 import pandas as pd
-import tensorflow as tf
-from pathlib import Path
-from PIL import Image
 import matplotlib.pyplot as plt
 import numpy as np
+from PIL import Image
 from sklearn.model_selection import train_test_split
-from math import ceil
+import tensorflow as tf
 from tensorflow.keras.layers import Dense
 from tensorflow.keras.models import Model
-import datetime
 import tqdm
+from pathlib import Path
+from math import ceil
+import datetime
 import pickle
 
 
@@ -50,14 +50,18 @@ def main():
     ''' For input resolution, check here, based on the choice of EfficientNet:
      https://keras.io/examples/vision/image_classification_efficientnet_fine_tuning/ '''
     input_res = (224, 224)
-    n_classes = 1  # Samples will be classified among the n_variables most frequent classes in the dataset
-    train_batch_size = 8
-    val_batch_size = 16
+    n_classes = 1  # Samples will be classified among the n_classes most frequent classes in the dataset
+    assert n_classes <= 14
+    train_batch_size = 24
+    val_batch_size = 32
+    p_test = .15  # Proportion of the dataset to be held out for test (test set)
     ''' The number of samples from the dataset to be used for training, validation and test of the model. Set to None
     to use all of the available samples. Used to make quick experiments on a small subset of the datasert '''
-    limit_samples = 32
+    limit_samples = None
     epochs = 25  # Number of epochs to run with the base network frozen (for transfer learning)
     epochs_ft = 200  # Number of epochs to run for fine-tuning
+    # If True, display all the training dataset being fed to the model , one row of pictures per batch, before training
+    vis_batches = False
     model_choice = tf.keras.applications.EfficientNetB0
 
     print(
@@ -65,7 +69,8 @@ def main():
     # Load the datasets metadata in dataframes
     dataset_root = '/mnt/storage/datasets/vinbigdata'
     metadata = pd.read_csv(Path(dataset_root + '/train.csv'))
-    test_metadata = pd.read_csv(Path(dataset_root + '/test.csv'))  # This is for the Kaggle competition, no GT available
+    # test.csv is for a Kaggle competition, no GT available
+    # test_metadata = pd.read_csv(Path(dataset_root + '/test.csv'))
 
     """ Process the dataset to assign, to each x-ray, one or more diagnosis, based on a majority vote among the 
     radiologists. If at least 2 radiologists out of 3 have given a same diagnosis to a given x-ray, then the 
@@ -86,7 +91,8 @@ def main():
     # If for any sample there is no consensus on any diagnosis, then set 'no finding' to 1 for that sample
     y[y.sum(axis=1) == 0, 14] = 1
 
-    # Sort classes based on their frequency in the dataset, ascending order; but leave out the class meaning 'no finding'
+    """ Sort classes based on their frequency in the dataset, ascending order; but leave out the class meaning 
+    'no finding' """
     y_ones_count = y.sum(axis=0)
     classes_by_freq = np.argsort(y_ones_count[:14])
 
@@ -104,20 +110,39 @@ def main():
     # Remove columns related to classes that won't be used
     metadata_df.drop(classes_by_freq[:len(classes_by_freq) - n_classes], axis=1, inplace=True)
 
-    ''' Rebuild the column for class 14, i.e. 'no finding': if the sample doesn't belong to any of the classes, then
-    ensure it belongs to class 14 '''
+    ''' Drop the column with indication of 'no finding' as it would otherwise interfere with calculation of sample
+    weights '''
     metadata_df.drop(14, axis=1, inplace=True)
+
     # Store the labels for the columns corresponding to dataset variables, will be used for training
     variable_labels = metadata_df.columns
+
+    """ Compute training sample weights, and add them as a new column to the dataframe. The sequence of labels (1 and 0) 
+    for each sample are interpreted as a binary number, which becomes a "class" for the given sample, for the 
+    purpose of calculating the sample weight. If the obtained "class" appears in the training dataset p times, and the 
+    dataset contains N samples overall, then the weight for the given samples is set to (N-p)/N.
+    TODO: could samples with very rare "class" get a weight so high to screw the gradient of the loss? """
+
+    def convert_to_int_class(row):
+        int_value = 0
+        for i, item in enumerate(row):
+            pos = len(row) - i - 1
+            int_value += item * (2 ** pos)
+        return int_value
+
+    int_class = metadata_df.apply(convert_to_int_class, axis=1)
+    int_class_counts = int_class.value_counts()
+    metadata_count = int_class.apply(lambda item: int_class_counts[item])
+    metadata_df['weights'] = (sum(int_class_counts) - metadata_count) / sum(int_class_counts)
+
+    ''' Rebuild the column for class 14, i.e. 'no finding': iff the sample doesn't belong to any of the classes, then
+    it belongs to class 14. Note that a 1 in this columns doesn't necessarily mean that radiologists gave a 
+    'no finding' diagnose for the sample.'''
     metadata_df[14] = pd.Series(metadata_df.sum(axis=1) == 0, dtype=int)
 
-    # Compute sample weights, and add them as a new column to the dataframe
-    totals = metadata_df.sum(axis=0)
-    totals = totals.multiply(-1)
-    totals = totals.add(len(metadata_df))
-    samples_weights = metadata_df.dot(totals)
-    samples_weights = pd.Series(samples_weights.divide((n_classes + 1) * len(metadata_df)), dtype=float)
-    metadata_df['weights'] = samples_weights
+    print(f'\nFound {len(int_class_counts)} class combinations while assigning weights to training samples.')
+    print(f'Most occurring class combination in training dataset appears {int_class_counts.max()} times.')
+    print(f'Least occurring class combination in training dataset appears {int_class_counts.min()} time(s).')
 
     # Add a column with the image file name
     metadata_df['image_id'] = dataset_root + '/train/' + images_ids + '.jpg'
@@ -131,11 +156,9 @@ def main():
 
     ''' Split the dataset into training, validation and test set; validation and test set contain the same number of 
     samples '''
-    p_test = .15  # Proportion of the dataset to be used as test set
     p_val = p_test / (1 - p_test)  # Proportion of the dataset not used for test to be used for validation
     metadata_train_val, metadata_test = train_test_split(metadata_df, test_size=p_test, random_state=42,
                                                          stratify=metadata_df[14])
-    # stratify_train_val = y_df[14].loc[y_train_val[14].index]
     metadata_train, metadata_val = train_test_split(metadata_train_val, test_size=p_val, random_state=42,
                                                     stratify=metadata_train_val[14])
 
@@ -147,27 +170,7 @@ def main():
     # sanity check
     assert len(metadata_train) + len(metadata_test) + len(metadata_val) == len(metadata_df)
 
-    # Load all the images of the training dataset and store them in memory, for visualization and training
-    """images_train = load_images(y_train['image_id'],
-                               resolution=input_res,
-                               n_classes=n_classes,
-                               dir=dataset_root + '/train',
-                               pickle_file='logs/train_images.pickle')"""
-
-    # File names of images are not needed in the dataframe anymore, drop them. Also, pop the series with weights from it
-    # weights = y_train['weights']
-    # y_train.drop(columns=['image_id', 'weights'], inplace=True)
-
-    def preprocess_sample(image, y, weight=None):
-        # TODO: move this at the bacth level for efficiency
-        ''' Note: the Keras pre-trained EfficientNet normalizes the images itself, assumes the input images are encoded
-        in the range [0, 255] '''
-        # Turn grayscale images into 3 channel images, as that is what the model expects as input
-        image = tf.stack([image, image, image], axis=2)
-        return (image, y) if weight is None else (image, y, weight)
-
     def load_image(x, y, weight=None):
-        # tf.print(x, output_stream=sys.stdout)
         image = tf.io.read_file(x)
         image = tf.io.decode_jpeg(image)
         image = tf.image.resize(image, size=input_res, method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
@@ -232,7 +235,9 @@ def main():
 
     # Append a final classification layer at the end of the base model (this will be trainable)
     x = pre_trained(inputs)
-    # TODO consider adding here batch normalization and then drop-out
+    x = Dense(1280//2, activation='sigmoid')(x)
+    # x = tf.keras.layers.BatchNormalization()(x)
+    # TODO consider adding here batch normalization and additional final classification layers
     y_train_freq = metadata_train[variable_labels].sum(axis=0) / len(metadata_train)
     bias_init = np.log(y_train_freq / (1 - y_train_freq)).to_numpy()
     outputs = Dense(n_classes, activation='sigmoid', bias_initializer=tf.keras.initializers.Constant(bias_init))(x)
@@ -266,13 +271,6 @@ def main():
 
     model = compile_model(model, learning_rate=3e-4)
 
-    """images_val = load_images(metadata_val['image_id'],
-                             resolution=input_res,
-                             n_classes=n_classes,
-                             dir=dataset_root + '/train',
-                             pickle_file='logs/val_images.pickle')"""
-    # metadata_val.drop(columns=['image_id', 'weights'], inplace=True)
-
     log_dir = 'logs/' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     print(f'\nLogging in directory {log_dir}')
     tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1)
@@ -300,7 +298,8 @@ def main():
         for batch in batch_iter:
             this_batch_size = batch[0].shape[0]
             mean = tf.math.reduce_mean(tf.cast(batch[0], dtype=tf.float32) / 255., axis=[0, 1, 2]) * this_batch_size
-            variance = tf.math.reduce_variance(tf.cast(batch[0], dtype=tf.float32) / 255., axis=[0, 1, 2]) * this_batch_size
+            variance = tf.math.reduce_variance(tf.cast(batch[0], dtype=tf.float32) / 255.,
+                                               axis=[0, 1, 2]) * this_batch_size
             total_mean.assign_add(mean)
             total_variance.assign_add(variance)
             batches_count += 1
@@ -338,7 +337,8 @@ def main():
     pre_trained.layers[2].mean.assign(mean)
     pre_trained.layers[2].variance.assign(variance)
 
-    # display_by_batch(dataset_train)
+    if vis_batches:
+        display_by_batch(dataset_train)
 
     history = model.fit(dataset_train,
                         epochs=epochs,
