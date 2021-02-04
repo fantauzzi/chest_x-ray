@@ -52,16 +52,16 @@ def main():
     input_res = (224, 224)
     n_classes = 1  # Samples will be classified among the n_classes most frequent classes in the dataset
     assert n_classes <= 14
+    limit_samples = None
     train_batch_size = 24
     val_batch_size = 32
+    epochs = 25  # Number of epochs to run with the base network frozen (for transfer learning)
+    epochs_ft = 200  # Number of epochs to run for fine-tuning
+    vis_batches = False
     p_test = .15  # Proportion of the dataset to be held out for test (test set)
     ''' The number of samples from the dataset to be used for training, validation and test of the model. Set to None
     to use all of the available samples. Used to make quick experiments on a small subset of the datasert '''
-    limit_samples = None
-    epochs = 25  # Number of epochs to run with the base network frozen (for transfer learning)
-    epochs_ft = 200  # Number of epochs to run for fine-tuning
     # If True, display all the training dataset being fed to the model , one row of pictures per batch, before training
-    vis_batches = False
     model_choice = tf.keras.applications.EfficientNetB0
 
     print(
@@ -110,39 +110,15 @@ def main():
     # Remove columns related to classes that won't be used
     metadata_df.drop(classes_by_freq[:len(classes_by_freq) - n_classes], axis=1, inplace=True)
 
-    ''' Drop the column with indication of 'no finding' as it would otherwise interfere with calculation of sample
-    weights '''
-    metadata_df.drop(14, axis=1, inplace=True)
-
-    # Store the labels for the columns corresponding to dataset variables, will be used for training
-    variable_labels = metadata_df.columns
-
-    """ Compute training sample weights, and add them as a new column to the dataframe. The sequence of labels (1 and 0) 
-    for each sample are interpreted as a binary number, which becomes a "class" for the given sample, for the 
-    purpose of calculating the sample weight. If the obtained "class" appears in the training dataset p times, and the 
-    dataset contains N samples overall, then the weight for the given samples is set to (N-p)/N.
-    TODO: could samples with very rare "class" get a weight so high to screw the gradient of the loss? """
-
-    def convert_to_int_class(row):
-        int_value = 0
-        for i, item in enumerate(row):
-            pos = len(row) - i - 1
-            int_value += item * (2 ** pos)
-        return int_value
-
-    int_class = metadata_df.apply(convert_to_int_class, axis=1)
-    int_class_counts = int_class.value_counts()
-    metadata_count = int_class.apply(lambda item: int_class_counts[item])
-    metadata_df['weights'] = (sum(int_class_counts) - metadata_count) / sum(int_class_counts)
-
     ''' Rebuild the column for class 14, i.e. 'no finding': iff the sample doesn't belong to any of the classes, then
     it belongs to class 14. Note that a 1 in this columns doesn't necessarily mean that radiologists gave a 
     'no finding' diagnose for the sample.'''
-    metadata_df[14] = pd.Series(metadata_df.sum(axis=1) == 0, dtype=int)
 
-    print(f'\nFound {len(int_class_counts)} class combinations while assigning weights to training samples.')
-    print(f'Most occurring class combination in training dataset appears {int_class_counts.max()} times.')
-    print(f'Least occurring class combination in training dataset appears {int_class_counts.min()} time(s).')
+    metadata_df.drop(14, axis=1, inplace=True)
+    ''' Store the labels for the columns corresponding to dataset variables, will be used for training. These must
+    not include column 14. '''
+    variable_labels = metadata_df.columns
+    metadata_df[14] = pd.Series(metadata_df.sum(axis=1) == 0, dtype=int)
 
     # Add a column with the image file name
     metadata_df['image_id'] = dataset_root + '/train/' + images_ids + '.jpg'
@@ -162,13 +138,35 @@ def main():
     metadata_train, metadata_val = train_test_split(metadata_train_val, test_size=p_val, random_state=42,
                                                     stratify=metadata_train_val[14])
 
-    # Now drop the column for class 14, 'no findig', as it is not needed anymore
+    ''' Now drop the column for class 14, 'no findig', as it is not needed anymore '''
     metadata_train = metadata_train.drop(14, axis=1)
     metadata_val = metadata_val.drop(14, axis=1)
     metadata_test = metadata_test.drop(14, axis=1)
 
     # sanity check
     assert len(metadata_train) + len(metadata_test) + len(metadata_val) == len(metadata_df)
+
+    """ Compute training sample weights, and add them as a new column to the dataframe. The sequence of labels (1 and 0) 
+    for each sample are interpreted as a binary number, which becomes a "class" for the given sample, for the 
+    purpose of calculating the sample weight. If the obtained "class" appears in the training dataset p times, and the 
+    dataset contains N samples overall, then the weight for the given samples is set to (N-p)/N.
+    TODO: could samples with very rare "class" get a weight so high to screw the gradient of the loss? """
+
+    def convert_to_int_class(row):
+        int_value = 0
+        for i, item in enumerate(row):
+            pos = len(row) - i - 1
+            int_value += item * (2 ** pos)
+        return int_value
+
+    int_class = metadata_train[variable_labels].apply(convert_to_int_class, axis=1)
+    int_class_counts = int_class.value_counts()
+    metadata_count = int_class.apply(lambda item: int_class_counts[item])
+    metadata_train['weights'] = (sum(int_class_counts) - metadata_count) / sum(int_class_counts)
+
+    print(f'\nFound {len(int_class_counts)} class combinations while assigning weights to training samples.')
+    print(f'Most occurring class combination in training dataset appears {int_class_counts.max()} times.')
+    print(f'Least occurring class combination in training dataset appears {int_class_counts.min()} time(s).')
 
     def load_image(x, y, weight=None):
         image = tf.io.read_file(x)
@@ -235,12 +233,18 @@ def main():
 
     # Append a final classification layer at the end of the base model (this will be trainable)
     x = pre_trained(inputs)
-    x = Dense(1280//2, activation='sigmoid')(x)
+    x = Dense(1280 // 2, activation='sigmoid', name='dense_1')(x)
     # x = tf.keras.layers.BatchNormalization()(x)
     # TODO consider adding here batch normalization and additional final classification layers
     y_train_freq = metadata_train[variable_labels].sum(axis=0) / len(metadata_train)
+    if min(y_train_freq) == 0:
+        print(
+            'Some of the variables are never set to 1 in the training dataset. Increase the number of variables to be considered, or the number of samples.')
+        print(y_train_freq)
+        exit(1)
     bias_init = np.log(y_train_freq / (1 - y_train_freq)).to_numpy()
-    outputs = Dense(n_classes, activation='sigmoid', bias_initializer=tf.keras.initializers.Constant(bias_init))(x)
+    outputs = Dense(n_classes, activation='sigmoid', bias_initializer=tf.keras.initializers.Constant(bias_init),
+                    name='dense_final')(x)
 
     model = Model(inputs=inputs, outputs=outputs)
 
@@ -288,6 +292,9 @@ def main():
                                 shuffle=True,
                                 for_model=True)
 
+    ''' Calculate mean and variance of each image channel across the training set, and set them in the normalization
+    layer of the pre-trained model '''
+
     def compute_normalization_params(dataset):
         # TODO: this computation is an approximation, consider to replace it with an exact one
         batch_iter = iter(dataset)
@@ -307,6 +314,11 @@ def main():
         total_mean.assign(total_mean / samples_count)
         total_variance.assign(total_variance / samples_count)
         return total_mean, total_variance
+
+    mean, variance = compute_normalization_params(dataset_train)
+    print(f'\nComputed mean {mean} and variance {variance} for the training dataset.')
+    pre_trained.layers[2].mean.assign(mean)
+    pre_trained.layers[2].variance.assign(variance)
 
     def display_by_batch(dataset):
         batch_iter = iter(dataset)
@@ -331,11 +343,6 @@ def main():
                 axs[i_batch, i_sample].set_yticks([])
         plt.draw()
         plt.pause(.01)
-
-    mean, variance = compute_normalization_params(dataset_train)
-    print(f'\nComputed mean {mean} and variance {variance} for the training dataset.')
-    pre_trained.layers[2].mean.assign(mean)
-    pre_trained.layers[2].variance.assign(variance)
 
     if vis_batches:
         display_by_batch(dataset_train)
@@ -373,9 +380,10 @@ if __name__ == '__main__':
     main()
 
 ''' TODO:
-Maximize images dynamic range
 Image augmentation
+Maximize images dynamic range
 Deeper final classifier
 Take pre-processing at batch level
-Try to simplify doing single class classification, possibly also detection 
+Try detection
+Try caching in the pipeline and run it through the profiler 
 '''
