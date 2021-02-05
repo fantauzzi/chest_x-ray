@@ -52,12 +52,12 @@ def main():
     input_res = (224, 224)
     n_classes = 1  # Samples will be classified among the n_classes most frequent classes in the dataset
     assert n_classes <= 14
-    limit_samples = None
-    train_batch_size = 24
+    limit_samples = 32
+    train_batch_size = 8
     val_batch_size = 32
     epochs = 25  # Number of epochs to run with the base network frozen (for transfer learning)
     epochs_ft = 200  # Number of epochs to run for fine-tuning
-    vis_batches = False
+    vis_batches = True
     p_test = .15  # Proportion of the dataset to be held out for test (test set)
     ''' The number of samples from the dataset to be used for training, validation and test of the model. Set to None
     to use all of the available samples. Used to make quick experiments on a small subset of the datasert '''
@@ -385,5 +385,6 @@ Maximize images dynamic range
 Deeper final classifier
 Take pre-processing at batch level
 Try detection
-Try caching in the pipeline and run it through the profiler 
+Try caching in the pipeline and run it through the profiler
+Try another NN (e.g. DenseNet) and also train it from scratch (no transfer learning)  
 '''
