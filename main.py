@@ -11,6 +11,7 @@ from pathlib import Path
 from math import ceil
 import datetime
 import pickle
+import random
 
 
 def load_images(file_names, resolution, n_classes, dir, pickle_file=None):
@@ -47,6 +48,7 @@ def load_images(file_names, resolution, n_classes, dir, pickle_file=None):
 
 
 def main():
+    random.seed(42)
     ''' For input resolution, check here, based on the choice of EfficientNet:
      https://keras.io/examples/vision/image_classification_efficientnet_fine_tuning/ '''
     input_res = (224, 224)
@@ -146,6 +148,37 @@ def main():
     # sanity check
     assert len(metadata_train) + len(metadata_test) + len(metadata_val) == len(metadata_df)
 
+    def augment_dataset(metadata):
+        # Extend the dataset to have one augmented sample for every non-augmented sample
+        def augment_sample(sample, augment):
+            max_zoom = .15
+            max_shear = 10
+            max_translate_x = .05
+            max_translate_y = .15
+            augmented = sample
+            if augment:
+                augmented['augmented'] = True
+                augmented['zoom_x'] = 1 + random.uniform(-max_zoom, max_zoom)
+                augmented['zoom_y'] = 1 + random.uniform(-max_zoom, max_zoom)
+                augmented['shear'] = random.uniform(-max_shear, max_shear)
+                augmented['translate_x'] = random.uniform(-max_translate_x, max_translate_x)
+                augmented['translate_y'] = random.uniform(-max_translate_y, max_translate_y)
+            else:
+                augmented['augmented'] = False
+                augmented['zoom_x'] = 1.
+                augmented['zoom_y'] = 1.
+                augmented['shear'] = .0
+                augmented['translate_x'] = .0
+                augmented['translate_y'] = .0
+            return augmented
+
+        metadata_aug = metadata.apply(augment_sample, args=(False,), axis=1)
+        metadata_aug2 = metadata.apply(augment_sample, args=(True,), axis=1)
+        metadata_aug = metadata_aug.append(metadata_aug2, ignore_index=True)
+        metadata_aug = metadata_aug.sample(frac=1, random_state=42)
+        return metadata_aug
+
+    metadata_train = augment_dataset(metadata_train)
     """ Compute training sample weights, and add them as a new column to the dataframe. The sequence of labels (1 and 0) 
     for each sample are interpreted as a binary number, which becomes a "class" for the given sample, for the 
     purpose of calculating the sample weight. If the obtained "class" appears in the training dataset p times, and the 
@@ -381,8 +414,6 @@ if __name__ == '__main__':
 
 ''' TODO:
 Image augmentation
-Maximize images dynamic range
-Deeper final classifier
 Take pre-processing at batch level
 Try detection
 Try caching in the pipeline and run it through the profiler
