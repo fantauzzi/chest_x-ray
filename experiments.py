@@ -160,27 +160,6 @@ def augmentation(image, x, y, weight):
     return image, x, y, weight
 
 
-def make_pipeline2(x, y, weights, batch_size, shuffle, for_model):
-    dataset = tf.data.Dataset.from_tensor_slices((x, y)) if weights is None else tf.data.Dataset.from_tensor_slices(
-        (x, y, weights))
-    if shuffle:
-        dataset = dataset.shuffle(buffer_size=len(y), seed=42, reshuffle_each_iteration=True)
-    dataset = dataset.map(load_image, num_parallel_calls=tf.data.AUTOTUNE)
-    dataset = dataset.map(
-        lambda *params: tf.py_function(func=augmentation,
-                                       inp=params,
-                                       Tout=[tf.uint8, tf.string, tf.int64] if weights is None else \
-                                           [tf.uint8, tf.string, tf.int64, tf.float64]
-                                       ),
-        num_parallel_calls=tf.data.AUTOTUNE)  # TODO Tout parameter must change when there are weights
-    # If the dataset is meant to be fed to a model (for training or inference) then strip the information on the file name
-    if for_model:
-        dataset = dataset.map(lambda *sample: (sample[0], sample[2]),
-                              num_parallel_calls=tf.data.AUTOTUNE) if weights is None else \
-            dataset.map(lambda *sample: (sample[0], sample[2], sample[3]), num_parallel_calls=tf.data.AUTOTUNE)
-    dataset = dataset.batch(batch_size=batch_size, drop_remainder=False)
-    dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
-    return dataset
 
 
 def make_pipeline(x, y, weights, batch_size, shuffle, for_model):
@@ -245,7 +224,6 @@ metadata_train = augment_dataset(metadata_train)
 dataset_samples = make_pipeline(x=metadata_train['image_id'],
                                 y=metadata_train[variable_labels],
                                 weights=metadata_train['weights'],
-                                # weights=[1.]*len(metadata_train),
                                 batch_size=n_cols * n_rows,
                                 shuffle=False,
                                 for_model=False)

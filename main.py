@@ -54,12 +54,12 @@ def main():
     input_res = (224, 224)
     n_classes = 1  # Samples will be classified among the n_classes most frequent classes in the dataset
     assert n_classes <= 14
-    limit_samples = 32
-    train_batch_size = 8
+    limit_samples = None
+    train_batch_size = 24
     val_batch_size = 32
     epochs = 25  # Number of epochs to run with the base network frozen (for transfer learning)
     epochs_ft = 200  # Number of epochs to run for fine-tuning
-    vis_batches = True
+    vis_batches = False
     p_test = .15  # Proportion of the dataset to be held out for test (test set)
     ''' The number of samples from the dataset to be used for training, validation and test of the model. Set to None
     to use all of the available samples. Used to make quick experiments on a small subset of the datasert '''
@@ -201,24 +201,98 @@ def main():
     print(f'Most occurring class combination in training dataset appears {int_class_counts.max()} times.')
     print(f'Least occurring class combination in training dataset appears {int_class_counts.min()} time(s).')
 
-    def load_image(x, y, weight=None):
+    def load_image2(x, y, weight=None):
         image = tf.io.read_file(x)
         image = tf.io.decode_jpeg(image)
         image = tf.image.resize(image, size=input_res, method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
         image = tf.image.grayscale_to_rgb(image)
         return (image, x, y) if weight is None else (image, x, y, weight)
 
-    def make_pipeline(x, y, weights, batch_size, shuffle, for_model):
-        dataset = tf.data.Dataset.from_tensor_slices((x, y)) if weights is None else tf.data.Dataset.from_tensor_slices(
-            (x, y, weights))
+    def load_image(x, *params):
+        # TODO consider returning the image in the range [0,1] already, and change the way it is fed to the model
+        image = tf.io.read_file(x)
+        image = tf.io.decode_jpeg(image)
+
+        # Perform all transformations on the image in the domain of floating point numbers [.0, 1.] , for improved accuracy
+        image = tf.cast(image, tf.float32)
+
+        # Maximise the image dynamic range, scaling the image values to the full interval [0-255]
+        the_min = tf.reduce_min(image)
+        the_max = tf.reduce_max(image)
+        image = (image - the_min) / (the_max - the_min) * 255
+
+        return (image, x) + params
+
+    def augment_sample(image, x, y, weight, augment, augment_params):
+        if augment == 1:
+            side = float(tf.shape(image)[0])
+            image_np = image.numpy()
+            fill_mode = 'constant'
+            cval = 0
+            order = 1
+            [zoom_x, zoom_y, shear, translate_x, translate_y] = augment_params
+            image_np = tf.keras.preprocessing.image.apply_affine_transform(image_np,
+                                                                           zx=zoom_x,
+                                                                           zy=zoom_y,
+                                                                           order=order,
+                                                                           fill_mode=fill_mode,
+                                                                           cval=cval)
+            image_np = tf.keras.preprocessing.image.apply_affine_transform(image_np,
+                                                                           shear=shear,
+                                                                           order=order,
+                                                                           fill_mode=fill_mode,
+                                                                           cval=cval)
+            image_np = tf.keras.preprocessing.image.apply_affine_transform(image_np,
+                                                                           tx=translate_x*side,
+                                                                           ty=translate_y*side,
+                                                                           order=order,
+                                                                           fill_mode=fill_mode,
+                                                                           cval=cval)
+            image = tf.convert_to_tensor(image_np)
+
+        # TODO consider moving the rest of this to a different function that can enter a computation graph
+
+        # Make the image square, padding with 0s as necessary
+        image_shape = tf.shape(image)
+        target_side = tf.math.maximum(image_shape[0], image_shape[1])
+        image = tf.image.resize_with_crop_or_pad(image, target_height=target_side, target_width=target_side)
+
+        # Re-sample the image to the expected input size and type for the model
+        image = tf.image.resize(image, size=input_res, method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
+        image = tf.math.round(image)
+        image = tf.cast(image, tf.uint8)
+        image = tf.image.grayscale_to_rgb(image)
+
+        return image, x, y, weight, augment, augment_params
+
+    def make_pipeline(x, y, weights, augment, augment_params, batch_size, shuffle, for_model):
+        if weights is None:
+            weights = pd.Series([1.] * len(x))
+        if augment is None or augment_params is None:
+            augment = pd.Series([False] * len(x))
+            augment_params_row = pd.Series({'zoom_x': 1.,
+                                            'zoom_y': 1.,
+                                            'shear': .0,
+                                            'translate_x': .0,
+                                            'translate_y': .0
+                                            })
+            augment_params = pd.DataFrame([augment_params_row] * len(x))
+        augment = augment.astype(dtype='int')
+        dataset = tf.data.Dataset.from_tensor_slices((x, y, weights, augment, augment_params))
         if shuffle:
             dataset = dataset.shuffle(buffer_size=len(y), seed=42, reshuffle_each_iteration=True)
         dataset = dataset.map(load_image, num_parallel_calls=tf.data.AUTOTUNE)
-        # If the dataset is meant to be fed to a model (for training or inference) then strip the information on the file name
+        dataset = dataset.map(
+            lambda *params: tf.py_function(func=augment_sample,
+                                           inp=params,
+                                           Tout=[tf.uint8, tf.string, tf.int64, tf.float64, tf.int64, tf.float64]
+                                           ),
+            num_parallel_calls=tf.data.AUTOTUNE)
+        ''' If the dataset is meant to be fed to a model (for training or inference) then strip the information on the 
+        file name and the augmentations. '''
         if for_model:
-            dataset = dataset.map(lambda *sample: (sample[0], sample[2]),
-                                  num_parallel_calls=tf.data.AUTOTUNE) if weights is None else \
-                dataset.map(lambda *sample: (sample[0], sample[2], sample[3]), num_parallel_calls=tf.data.AUTOTUNE)
+            dataset = dataset.map(lambda *sample: (sample[0], sample[2], sample[3]),
+                                  num_parallel_calls=tf.data.AUTOTUNE)
         dataset = dataset.batch(batch_size=batch_size, drop_remainder=False)
         dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
         return dataset
@@ -226,9 +300,12 @@ def main():
     # Show a couple images from a pipeline, along with their GT, as a sanity check
     n_cols = 4
     n_rows = ceil(16 / n_cols)
+    aug_param_labels = ['zoom_x', 'zoom_y', 'shear', 'translate_x', 'translate_y']
     dataset_samples = make_pipeline(x=metadata_train['image_id'],
                                     y=metadata_train[variable_labels],
                                     weights=None,
+                                    augment=metadata_train['augmented'],
+                                    augment_params=metadata_train[aug_param_labels],
                                     batch_size=n_cols * n_rows,
                                     shuffle=True,
                                     for_model=False)
@@ -315,12 +392,16 @@ def main():
     dataset_train = make_pipeline(x=metadata_train['image_id'],
                                   y=metadata_train[variable_labels],
                                   weights=metadata_train['weights'],
+                                  augment=metadata_train['augmented'],
+                                  augment_params=metadata_train[aug_param_labels],
                                   batch_size=train_batch_size,
                                   shuffle=True,
                                   for_model=True)
     dataset_val = make_pipeline(x=metadata_val['image_id'],
                                 y=metadata_val[variable_labels],
                                 weights=None,
+                                augment=None,
+                                augment_params=None,
                                 batch_size=val_batch_size,
                                 shuffle=True,
                                 for_model=True)
