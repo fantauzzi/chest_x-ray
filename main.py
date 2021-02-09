@@ -8,7 +8,9 @@ from tensorflow.keras.models import Model
 from pathlib import Path
 from math import ceil
 import datetime
+import pickle
 import random
+from tqdm import tqdm
 
 
 def main():
@@ -18,7 +20,7 @@ def main():
     ''' For input resolution, check here, based on the choice of EfficientNet:
      https://keras.io/examples/vision/image_classification_efficientnet_fine_tuning/ '''
     input_res = (224, 224)
-    n_classes = 1  # Samples will be classified among the n_classes most frequent classes in the dataset
+    n_classes = 3  # Samples will be classified among the n_classes most frequent classes in the dataset
     assert n_classes <= 14
     limit_samples = None
     train_batch_size = 24
@@ -32,10 +34,14 @@ def main():
     # If True, display all the training dataset being fed to the model , one row of pictures per batch, before training
     model_choice = tf.keras.applications.EfficientNetB0
 
+    aug_param_labels = ['zoom_x', 'zoom_y', 'shear', 'translate_x', 'translate_y']
+
     print(
         f'Input resolution {input_res}\nTraining batch size {train_batch_size}\nValidation batch size {val_batch_size}')
     # Load the datasets metadata in dataframes
     dataset_root = '/mnt/storage/datasets/vinbigdata'
+    metadata_pickle_fname = dataset_root + '/metadata.pickle'
+
     metadata = pd.read_csv(Path(dataset_root + '/train.csv'))
     # test.csv is for a Kaggle competition, no GT available
     # test_metadata = pd.read_csv(Path(dataset_root + '/test.csv'))
@@ -114,35 +120,129 @@ def main():
     # sanity check
     assert len(metadata_train) + len(metadata_test) + len(metadata_val) == len(metadata_df)
 
-    def augment_dataset(metadata):
-        # Extend the dataset to have one augmented sample for every non-augmented sample
-        def augment_sample(sample, augment):
-            max_zoom = .15
-            max_shear = 10
-            max_translate_x = .05
-            max_translate_y = .15
-            augmented = sample
-            if augment:
-                augmented['augmented'] = True
-                augmented['zoom_x'] = 1 + random.uniform(-max_zoom, max_zoom)
-                augmented['zoom_y'] = 1 + random.uniform(-max_zoom, max_zoom)
-                augmented['shear'] = random.uniform(-max_shear, max_shear)
-                augmented['translate_x'] = random.uniform(-max_translate_x, max_translate_x)
-                augmented['translate_y'] = random.uniform(-max_translate_y, max_translate_y)
-            else:
-                augmented['augmented'] = False
-                augmented['zoom_x'] = 1.
-                augmented['zoom_y'] = 1.
-                augmented['shear'] = .0
-                augmented['translate_x'] = .0
-                augmented['translate_y'] = .0
-            return augmented
+    def draw_augmentation(sample):
+        max_zoom = .15
+        max_shear = 10
+        max_translate_x = .05
+        max_translate_y = .15
+        augmented = sample
+        augmented['zoom_x'] = 1 + random.uniform(-max_zoom, max_zoom)
+        augmented['zoom_y'] = 1 + random.uniform(-max_zoom, max_zoom)
+        augmented['shear'] = random.uniform(-max_shear, max_shear)
+        augmented['translate_x'] = random.uniform(-max_translate_x, max_translate_x)
+        augmented['translate_y'] = random.uniform(-max_translate_y, max_translate_y)
+        ''' File name  of the augmented image is obtained from the original image file name, appending '_01' to its 
+        stem; augmented images go to their own directory. '''
+        augmented['aug_image_id'] = dataset_root + '/aug-train/' + Path(sample['image_id']).stem + '_01.png'
+        return augmented
 
-        metadata_aug = metadata.apply(augment_sample, args=(False,), axis=1)
-        metadata_aug2 = metadata.apply(augment_sample, args=(True,), axis=1)
-        metadata_aug = metadata_aug.append(metadata_aug2, ignore_index=True)
-        metadata_aug = metadata_aug.sample(frac=1, random_state=42)
-        return metadata_aug
+    def load_sample(file_name, *params):
+        # TODO consider returning the image in the range [0,1] already, and change the way it is fed to the model
+        image = tf.io.read_file(file_name)
+        image = tf.io.decode_jpeg(image)
+
+        # Perform all transformations on the image in the domain of floating point numbers [.0, 1.] , for improved accuracy
+        image = tf.cast(image, tf.float32)
+
+        # Maximise the image dynamic range, scaling the image values to the full interval [0-255]
+        the_min = tf.reduce_min(image)
+        the_max = tf.reduce_max(image)
+        image = (image - the_min) / (the_max - the_min) * 255
+
+        return (image, file_name) + params
+
+    def augment_sample(image, file_name, aug_file_name, y, augment_params):
+        side = float(tf.shape(image)[0])
+        image_np = image.numpy()
+        fill_mode = 'constant'
+        cval = 0
+        order = 1
+        [zoom_x, zoom_y, shear, translate_x, translate_y] = augment_params
+        image_np = tf.keras.preprocessing.image.apply_affine_transform(image_np,
+                                                                       zx=zoom_x,
+                                                                       zy=zoom_y,
+                                                                       order=order,
+                                                                       fill_mode=fill_mode,
+                                                                       cval=cval)
+        image_np = tf.keras.preprocessing.image.apply_affine_transform(image_np,
+                                                                       shear=shear,
+                                                                       order=order,
+                                                                       fill_mode=fill_mode,
+                                                                       cval=cval)
+        image_np = tf.keras.preprocessing.image.apply_affine_transform(image_np,
+                                                                       tx=translate_x * side,
+                                                                       ty=translate_y * side,
+                                                                       order=order,
+                                                                       fill_mode=fill_mode,
+                                                                       cval=cval)
+        image = tf.convert_to_tensor(image_np)
+
+        return image, file_name, aug_file_name, y, augment_params
+
+    def finalize_and_save_sample(image, file_name, aug_file_name, y=None, augment_params=None):
+        # Make the image square, padding with 0s as necessary
+        image_shape = tf.shape(image)
+        target_side = tf.math.maximum(image_shape[0], image_shape[1])
+        image = tf.image.resize_with_crop_or_pad(image, target_height=target_side, target_width=target_side)
+
+        # Re-sample the image to the expected input size and type for the model
+        image = tf.image.resize(image, size=input_res, method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
+        image = tf.math.round(image)
+        image = tf.cast(image, tf.uint8)
+        image_encoded = tf.io.encode_png(image, compression=-1)
+        tf.io.write_file(aug_file_name, image_encoded)
+
+        return aug_file_name
+
+    def make_aug_pipeline(file_names, y, augment_params, aug_file_names):
+        dataset = tf.data.Dataset.from_tensor_slices((file_names, aug_file_names, y, augment_params))
+        dataset = dataset.map(load_sample, num_parallel_calls=tf.data.AUTOTUNE)
+        dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+        dataset = dataset.map(
+            lambda *params: tf.py_function(func=augment_sample,
+                                           inp=params,
+                                           Tout=[tf.float32, tf.string, tf.string, tf.int64, tf.float64]
+                                           ),
+            num_parallel_calls=tf.data.AUTOTUNE)
+        dataset = dataset.map(finalize_and_save_sample, num_parallel_calls=tf.data.AUTOTUNE)
+        dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+
+        return dataset
+
+    def make_pre_process_pipeline(file_names, preprocess_file_names):
+        dataset = tf.data.Dataset.from_tensor_slices((file_names, preprocess_file_names))
+        dataset = dataset.map(load_sample, num_parallel_calls=tf.data.AUTOTUNE)
+        dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+        dataset = dataset.map(finalize_and_save_sample, num_parallel_calls=tf.data.AUTOTUNE)
+        dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+
+        return dataset
+
+    if Path(metadata_pickle_fname).is_file():
+        with open(metadata_pickle_fname, 'rb') as pickle_f:
+            metadata_aug = pickle.load(pickle_f)
+    else:
+        """with open(metadata_pickle_fname, 'wb') as pickle_f:
+            pickle.dump(metadata_aug, pickle_f, pickle.HIGHEST_PROTOCOL)"""
+        # TODO consider vectorizing the operation below (e.g. with numpy), instead of repeating it on every df row
+        preprocess_file_names = metadata_train['image_id'].apply(
+            lambda file_name: dataset_root + '/aug-train/' + Path(file_name).stem + '_00.png')
+        preprocess_pipeline = make_pre_process_pipeline(file_names=metadata_train['image_id'],
+                                                        preprocess_file_names=preprocess_file_names)
+        for _ in tqdm(preprocess_pipeline):
+            pass
+
+        metadata_aug = metadata_train.apply(draw_augmentation, axis=1)
+        aug_pipeline = make_aug_pipeline(file_names=metadata_aug['image_id'],
+                                         y=metadata_aug[variable_labels],
+                                         augment_params=metadata_aug[aug_param_labels],
+                                         aug_file_names=metadata_aug['aug_image_id'])
+        for _ in tqdm(aug_pipeline):
+            pass
+
+        metadata_train['image_id'] = preprocess_file_names
+
+    exit(0)
 
     metadata_train = augment_dataset(metadata_train)
     """ Compute training sample weights, and add them as a new column to the dataframe. The sequence of labels (1 and 0) 
@@ -265,7 +365,6 @@ def main():
     # Show a couple images from a pipeline, along with their GT, as a sanity check
     n_cols = 4
     n_rows = ceil(16 / n_cols)
-    aug_param_labels = ['zoom_x', 'zoom_y', 'shear', 'translate_x', 'translate_y']
     metadata_samples = metadata_train.sample(n=16, random_state=42)
     dataset_samples = make_pipeline(x=metadata_samples['image_id'],
                                     y=metadata_samples[variable_labels],
