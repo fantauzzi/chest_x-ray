@@ -1,54 +1,20 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
-from PIL import Image
 from sklearn.model_selection import train_test_split
 import tensorflow as tf
 from tensorflow.keras.layers import Dense
 from tensorflow.keras.models import Model
-import tqdm
 from pathlib import Path
 from math import ceil
 import datetime
-import pickle
 import random
-
-
-def load_images(file_names, resolution, n_classes, dir, pickle_file=None):
-    images = np.zeros(shape=(len(file_names), resolution[0], resolution[1]), dtype=np.uint8)
-    if pickle_file is not None and Path(pickle_file).is_file():
-        print(f'\nReading pickled images from file {pickle_file}')
-        with open(pickle_file, 'rb') as the_file:
-            from_pickle = pickle.load(the_file)
-        if not from_pickle['file_names'].equals(file_names) or from_pickle['dir'] != dir or from_pickle[
-            'resolution'] != resolution or n_classes != from_pickle['n_classes']:
-            print(
-                f'Data in pickle file {pickle_file} don\'t match data that are needed. To rebuild the pickle file, delete it and re-run the program')
-            exit(-1)
-        images = from_pickle['images']
-        print(f'Read {len(images)} images from the file.')
-        return images
-
-    for i in tqdm.trange(len(file_names)):
-        name = file_names.iloc[i]
-        # TODO try with matplotlib and tf.image.resize()
-        pil_image = Image.open(dir + '/' + name)
-        pil_image = pil_image.resize(resolution, resample=3)
-        image = np.array(pil_image, dtype=np.uint8)
-        images[i] = image
-
-    if pickle_file is not None:
-        pickle_this = {'file_names': file_names, 'dir': dir, 'resolution': resolution, 'images': images,
-                       'n_classes': n_classes}
-        print(f'\nPickling images in file {pickle_file}')
-        with open(pickle_file, 'wb') as pickle_file:
-            pickle.dump(pickle_this, pickle_file, pickle.HIGHEST_PROTOCOL)
-        print(f'Pickled {len(images)} images in the file.')
-        return images
 
 
 def main():
     random.seed(42)
+    ''' gpu_private is bad idea! Batching would only run on a few of the available threads, under-utilizing the CPU '''
+    # os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
     ''' For input resolution, check here, based on the choice of EfficientNet:
      https://keras.io/examples/vision/image_classification_efficientnet_fine_tuning/ '''
     input_res = (224, 224)
@@ -57,7 +23,7 @@ def main():
     limit_samples = None
     train_batch_size = 24
     val_batch_size = 32
-    epochs = 25  # Number of epochs to run with the base network frozen (for transfer learning)
+    epochs = 5  # Number of epochs to run with the base network frozen (for transfer learning)
     epochs_ft = 200  # Number of epochs to run for fine-tuning
     vis_batches = False
     p_test = .15  # Proportion of the dataset to be held out for test (test set)
@@ -201,13 +167,6 @@ def main():
     print(f'Most occurring class combination in training dataset appears {int_class_counts.max()} times.')
     print(f'Least occurring class combination in training dataset appears {int_class_counts.min()} time(s).')
 
-    def load_image2(x, y, weight=None):
-        image = tf.io.read_file(x)
-        image = tf.io.decode_jpeg(image)
-        image = tf.image.resize(image, size=input_res, method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
-        image = tf.image.grayscale_to_rgb(image)
-        return (image, x, y) if weight is None else (image, x, y, weight)
-
     def load_image(x, *params):
         # TODO consider returning the image in the range [0,1] already, and change the way it is fed to the model
         image = tf.io.read_file(x)
@@ -243,15 +202,16 @@ def main():
                                                                            fill_mode=fill_mode,
                                                                            cval=cval)
             image_np = tf.keras.preprocessing.image.apply_affine_transform(image_np,
-                                                                           tx=translate_x*side,
-                                                                           ty=translate_y*side,
+                                                                           tx=translate_x * side,
+                                                                           ty=translate_y * side,
                                                                            order=order,
                                                                            fill_mode=fill_mode,
                                                                            cval=cval)
             image = tf.convert_to_tensor(image_np)
 
-        # TODO consider moving the rest of this to a different function that can enter a computation graph
+        return image, x, y, weight, augment, augment_params
 
+    def finalize_sample(image, x, y, weight, augment, augment_params):
         # Make the image square, padding with 0s as necessary
         image_shape = tf.shape(image)
         target_side = tf.math.maximum(image_shape[0], image_shape[1])
@@ -278,36 +238,42 @@ def main():
                                             })
             augment_params = pd.DataFrame([augment_params_row] * len(x))
         augment = augment.astype(dtype='int')
+
         dataset = tf.data.Dataset.from_tensor_slices((x, y, weights, augment, augment_params))
+        if for_model:
+            dataset = dataset.cache()
         if shuffle:
             dataset = dataset.shuffle(buffer_size=len(y), seed=42, reshuffle_each_iteration=True)
         dataset = dataset.map(load_image, num_parallel_calls=tf.data.AUTOTUNE)
         dataset = dataset.map(
             lambda *params: tf.py_function(func=augment_sample,
                                            inp=params,
-                                           Tout=[tf.uint8, tf.string, tf.int64, tf.float64, tf.int64, tf.float64]
+                                           Tout=[tf.float32, tf.string, tf.int64, tf.float64, tf.int64, tf.float64]
                                            ),
             num_parallel_calls=tf.data.AUTOTUNE)
+        dataset = dataset.map(finalize_sample, num_parallel_calls=tf.data.AUTOTUNE)
         ''' If the dataset is meant to be fed to a model (for training or inference) then strip the information on the 
         file name and the augmentations. '''
         if for_model:
             dataset = dataset.map(lambda *sample: (sample[0], sample[2], sample[3]),
                                   num_parallel_calls=tf.data.AUTOTUNE)
         dataset = dataset.batch(batch_size=batch_size, drop_remainder=False)
-        dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+        dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+
         return dataset
 
     # Show a couple images from a pipeline, along with their GT, as a sanity check
     n_cols = 4
     n_rows = ceil(16 / n_cols)
     aug_param_labels = ['zoom_x', 'zoom_y', 'shear', 'translate_x', 'translate_y']
-    dataset_samples = make_pipeline(x=metadata_train['image_id'],
-                                    y=metadata_train[variable_labels],
+    metadata_samples = metadata_train.sample(n=16, random_state=42)
+    dataset_samples = make_pipeline(x=metadata_samples['image_id'],
+                                    y=metadata_samples[variable_labels],
                                     weights=None,
-                                    augment=metadata_train['augmented'],
-                                    augment_params=metadata_train[aug_param_labels],
+                                    augment=metadata_samples['augmented'],
+                                    augment_params=metadata_samples[aug_param_labels],
                                     batch_size=n_cols * n_rows,
-                                    shuffle=True,
+                                    shuffle=False,
                                     for_model=False)
     samples_iter = iter(dataset_samples)
     samples = next(samples_iter)
@@ -385,10 +351,6 @@ def main():
 
     model = compile_model(model, learning_rate=3e-4)
 
-    log_dir = 'logs/' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    print(f'\nLogging in directory {log_dir}')
-    tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1)
-
     dataset_train = make_pipeline(x=metadata_train['image_id'],
                                   y=metadata_train[variable_labels],
                                   weights=metadata_train['weights'],
@@ -429,10 +391,13 @@ def main():
         total_variance.assign(total_variance / samples_count)
         return total_mean, total_variance
 
+    """
+    print('\nComputing mean and variance across (augmented) training dataset')
     mean, variance = compute_normalization_params(dataset_train)
-    print(f'\nComputed mean {mean} and variance {variance} for the training dataset.')
+    print(f'Computed mean {mean} and variance {variance} for the training dataset.')
     pre_trained.layers[2].mean.assign(mean)
     pre_trained.layers[2].variance.assign(variance)
+    """
 
     def display_by_batch(dataset):
         batch_iter = iter(dataset)
@@ -461,12 +426,21 @@ def main():
     if vis_batches:
         display_by_batch(dataset_train)
 
+    log_dir = 'logs/' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    print(f'\nLogging in directory {log_dir}')
+    # tf.profiler.experimental.start(logdir=log_dir)
+    train_batches_per_epoch = ceil(len(metadata_train) / train_batch_size)
+    tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir,
+                                                          histogram_freq=1,
+                                                          profile_batch=(1, min(train_batches_per_epoch, 16)))
+
     history = model.fit(dataset_train,
                         epochs=epochs,
                         validation_data=dataset_val,
                         shuffle=False,  # Shuffling is already done on the dataset before it is being fed to fit()
                         callbacks=[tensorboard_callback],
                         verbose=1)
+    # tf.profiler.experimental.stop(save=True)
 
     # Un-freeze the weights of the base model to fine tune. Also see https://bit.ly/2YnJwqg
     print('\nFine-tuning the model.')
@@ -480,7 +454,9 @@ def main():
 
     log_dir_ft = 'logs/' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     print(f'\nLogging in directory {log_dir_ft}')
-    tensorboard_callback_ft = tf.keras.callbacks.TensorBoard(log_dir=log_dir_ft, histogram_freq=1)
+    tensorboard_callback_ft = tf.keras.callbacks.TensorBoard(log_dir=log_dir_ft,
+                                                             histogram_freq=1,
+                                                             profile_batch=0)
 
     history_ft = model.fit(dataset_train,
                            epochs=epochs_ft,
