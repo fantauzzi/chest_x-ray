@@ -20,12 +20,12 @@ def main():
     ''' For input resolution, check here, based on the choice of EfficientNet:
      https://keras.io/examples/vision/image_classification_efficientnet_fine_tuning/ '''
     input_res = (224, 224)
-    n_classes = 3  # Samples will be classified among the n_classes most frequent classes in the dataset
+    n_classes = 1  # Samples will be classified among the n_classes most frequent classes in the dataset
     assert n_classes <= 14
     limit_samples = None
     train_batch_size = 24
     val_batch_size = 32
-    epochs = 5  # Number of epochs to run with the base network frozen (for transfer learning)
+    epochs = 20  # Number of epochs to run with the base network frozen (for transfer learning)
     epochs_ft = 200  # Number of epochs to run for fine-tuning
     vis_batches = False
     p_test = .15  # Proportion of the dataset to be held out for test (test set)
@@ -194,6 +194,20 @@ def main():
 
         return aug_file_name
 
+    def finalize_sample(image, *params):
+        # Make the image square, padding with 0s as necessary
+        image_shape = tf.shape(image)
+        target_side = tf.math.maximum(image_shape[0], image_shape[1])
+        image = tf.image.resize_with_crop_or_pad(image, target_height=target_side, target_width=target_side)
+
+        # Re-sample the image to the expected input size and type for the model
+        image = tf.image.resize(image, size=input_res, method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
+        image = tf.math.round(image)
+        image = tf.cast(image, tf.uint8)
+        image = tf.image.grayscale_to_rgb(image)
+
+        return (image,) + params
+
     def make_aug_pipeline(file_names, y, augment_params, aug_file_names):
         dataset = tf.data.Dataset.from_tensor_slices((file_names, aug_file_names, y, augment_params))
         dataset = dataset.map(load_sample, num_parallel_calls=tf.data.AUTOTUNE)
@@ -220,10 +234,8 @@ def main():
 
     if Path(metadata_pickle_fname).is_file():
         with open(metadata_pickle_fname, 'rb') as pickle_f:
-            metadata_aug = pickle.load(pickle_f)
+            metadata_train = pickle.load(pickle_f)
     else:
-        """with open(metadata_pickle_fname, 'wb') as pickle_f:
-            pickle.dump(metadata_aug, pickle_f, pickle.HIGHEST_PROTOCOL)"""
         # TODO consider vectorizing the operation below (e.g. with numpy), instead of repeating it on every df row
         preprocess_file_names = metadata_train['image_id'].apply(
             lambda file_name: dataset_root + '/aug-train/' + Path(file_name).stem + '_00.png')
@@ -231,7 +243,6 @@ def main():
                                                         preprocess_file_names=preprocess_file_names)
         for _ in tqdm(preprocess_pipeline):
             pass
-
         metadata_aug = metadata_train.apply(draw_augmentation, axis=1)
         aug_pipeline = make_aug_pipeline(file_names=metadata_aug['image_id'],
                                          y=metadata_aug[variable_labels],
@@ -242,9 +253,14 @@ def main():
 
         metadata_train['image_id'] = preprocess_file_names
 
-    exit(0)
+        metadata_aug.drop(aug_param_labels + ['image_id'], axis=1, inplace=True)
+        metadata_aug.rename(columns={'aug_image_id': 'image_id'}, inplace=True)
+        metadata_train = metadata_train.append(metadata_aug, ignore_index=True)
+        metadata_train = metadata_train.sample(frac=1, random_state=42)
+        with open(metadata_pickle_fname, 'wb') as pickle_f:
+            pickle.dump(metadata_train, pickle_f, pickle.HIGHEST_PROTOCOL)
 
-    metadata_train = augment_dataset(metadata_train)
+    # metadata_train = augment_dataset(metadata_train)
     """ Compute training sample weights, and add them as a new column to the dataframe. The sequence of labels (1 and 0) 
     for each sample are interpreted as a binary number, which becomes a "class" for the given sample, for the 
     purpose of calculating the sample weight. If the obtained "class" appears in the training dataset p times, and the 
@@ -267,93 +283,25 @@ def main():
     print(f'Most occurring class combination in training dataset appears {int_class_counts.max()} times.')
     print(f'Least occurring class combination in training dataset appears {int_class_counts.min()} time(s).')
 
-    def load_image(x, *params):
+    def load_image(file_name, *params):
         # TODO consider returning the image in the range [0,1] already, and change the way it is fed to the model
-        image = tf.io.read_file(x)
-        image = tf.io.decode_jpeg(image)
-
-        # Perform all transformations on the image in the domain of floating point numbers [.0, 1.] , for improved accuracy
-        image = tf.cast(image, tf.float32)
-
-        # Maximise the image dynamic range, scaling the image values to the full interval [0-255]
-        the_min = tf.reduce_min(image)
-        the_max = tf.reduce_max(image)
-        image = (image - the_min) / (the_max - the_min) * 255
-
-        return (image, x) + params
-
-    def augment_sample(image, x, y, weight, augment, augment_params):
-        if augment == 1:
-            side = float(tf.shape(image)[0])
-            image_np = image.numpy()
-            fill_mode = 'constant'
-            cval = 0
-            order = 1
-            [zoom_x, zoom_y, shear, translate_x, translate_y] = augment_params
-            image_np = tf.keras.preprocessing.image.apply_affine_transform(image_np,
-                                                                           zx=zoom_x,
-                                                                           zy=zoom_y,
-                                                                           order=order,
-                                                                           fill_mode=fill_mode,
-                                                                           cval=cval)
-            image_np = tf.keras.preprocessing.image.apply_affine_transform(image_np,
-                                                                           shear=shear,
-                                                                           order=order,
-                                                                           fill_mode=fill_mode,
-                                                                           cval=cval)
-            image_np = tf.keras.preprocessing.image.apply_affine_transform(image_np,
-                                                                           tx=translate_x * side,
-                                                                           ty=translate_y * side,
-                                                                           order=order,
-                                                                           fill_mode=fill_mode,
-                                                                           cval=cval)
-            image = tf.convert_to_tensor(image_np)
-
-        return image, x, y, weight, augment, augment_params
-
-    def finalize_sample(image, x, y, weight, augment, augment_params):
-        # Make the image square, padding with 0s as necessary
-        image_shape = tf.shape(image)
-        target_side = tf.math.maximum(image_shape[0], image_shape[1])
-        image = tf.image.resize_with_crop_or_pad(image, target_height=target_side, target_width=target_side)
-
-        # Re-sample the image to the expected input size and type for the model
-        image = tf.image.resize(image, size=input_res, method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
-        image = tf.math.round(image)
-        image = tf.cast(image, tf.uint8)
+        image = tf.io.read_file(file_name)
+        image = tf.io.decode_png(image)
         image = tf.image.grayscale_to_rgb(image)
+        # tf.print(f'Image {file_name} has shape {image.shape}')
+        return (image, file_name) + params
 
-        return image, x, y, weight, augment, augment_params
-
-    def make_pipeline(x, y, weights, augment, augment_params, batch_size, shuffle, for_model):
+    def make_pipeline(file_names, y, weights, batch_size, shuffle, for_model):
         if weights is None:
-            weights = pd.Series([1.] * len(x))
-        if augment is None or augment_params is None:
-            augment = pd.Series([False] * len(x))
-            augment_params_row = pd.Series({'zoom_x': 1.,
-                                            'zoom_y': 1.,
-                                            'shear': .0,
-                                            'translate_x': .0,
-                                            'translate_y': .0
-                                            })
-            augment_params = pd.DataFrame([augment_params_row] * len(x))
-        augment = augment.astype(dtype='int')
+            weights = pd.Series([1.] * len(file_names))
 
-        dataset = tf.data.Dataset.from_tensor_slices((x, y, weights, augment, augment_params))
-        if for_model:
-            dataset = dataset.cache()
+        dataset = tf.data.Dataset.from_tensor_slices((file_names, y, weights))
+        dataset = dataset.cache()
         if shuffle:
             dataset = dataset.shuffle(buffer_size=len(y), seed=42, reshuffle_each_iteration=True)
         dataset = dataset.map(load_image, num_parallel_calls=tf.data.AUTOTUNE)
-        dataset = dataset.map(
-            lambda *params: tf.py_function(func=augment_sample,
-                                           inp=params,
-                                           Tout=[tf.float32, tf.string, tf.int64, tf.float64, tf.int64, tf.float64]
-                                           ),
-            num_parallel_calls=tf.data.AUTOTUNE)
-        dataset = dataset.map(finalize_sample, num_parallel_calls=tf.data.AUTOTUNE)
         ''' If the dataset is meant to be fed to a model (for training or inference) then strip the information on the 
-        file name and the augmentations. '''
+        file name '''
         if for_model:
             dataset = dataset.map(lambda *sample: (sample[0], sample[2], sample[3]),
                                   num_parallel_calls=tf.data.AUTOTUNE)
@@ -362,15 +310,27 @@ def main():
 
         return dataset
 
+    def make_val_pipeline(file_names, y, batch_size, for_model):
+        dataset = tf.data.Dataset.from_tensor_slices((file_names, y))
+        dataset = dataset.cache()
+        dataset = dataset.map(load_sample, num_parallel_calls=tf.data.AUTOTUNE)
+        dataset = dataset.map(finalize_sample, num_parallel_calls=tf.data.AUTOTUNE)
+        ''' If the dataset is meant to be fed to a model (for training or inference) then strip the information on the 
+        file name '''
+        if for_model:
+            dataset = dataset.map(lambda *sample: (sample[0], sample[2]),
+                                  num_parallel_calls=tf.data.AUTOTUNE)
+        dataset = dataset.batch(batch_size=batch_size, drop_remainder=False)
+        dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+        return dataset
+
     # Show a couple images from a pipeline, along with their GT, as a sanity check
     n_cols = 4
     n_rows = ceil(16 / n_cols)
     metadata_samples = metadata_train.sample(n=16, random_state=42)
-    dataset_samples = make_pipeline(x=metadata_samples['image_id'],
+    dataset_samples = make_pipeline(file_names=metadata_samples['image_id'],
                                     y=metadata_samples[variable_labels],
                                     weights=None,
-                                    augment=metadata_samples['augmented'],
-                                    augment_params=metadata_samples[aug_param_labels],
                                     batch_size=n_cols * n_rows,
                                     shuffle=False,
                                     for_model=False)
@@ -416,7 +376,7 @@ def main():
         print(
             'Some of the variables are never set to 1 in the training dataset. Increase the number of variables to be considered, or the number of samples.')
         print(y_train_freq)
-        exit(1)
+        exit(-1)
     bias_init = np.log(y_train_freq / (1 - y_train_freq)).to_numpy()
     outputs = Dense(n_classes, activation='sigmoid', bias_initializer=tf.keras.initializers.Constant(bias_init),
                     name='dense_final')(x)
@@ -450,22 +410,16 @@ def main():
 
     model = compile_model(model, learning_rate=3e-4)
 
-    dataset_train = make_pipeline(x=metadata_train['image_id'],
+    dataset_train = make_pipeline(file_names=metadata_train['image_id'],
                                   y=metadata_train[variable_labels],
                                   weights=metadata_train['weights'],
-                                  augment=metadata_train['augmented'],
-                                  augment_params=metadata_train[aug_param_labels],
                                   batch_size=train_batch_size,
                                   shuffle=True,
                                   for_model=True)
-    dataset_val = make_pipeline(x=metadata_val['image_id'],
-                                y=metadata_val[variable_labels],
-                                weights=None,
-                                augment=None,
-                                augment_params=None,
-                                batch_size=val_batch_size,
-                                shuffle=True,
-                                for_model=True)
+    dataset_val = make_val_pipeline(file_names=metadata_val['image_id'],
+                                    y=metadata_val[variable_labels],
+                                    batch_size=val_batch_size,
+                                    for_model=True)
 
     ''' Calculate mean and variance of each image channel across the training set, and set them in the normalization
     layer of the pre-trained model '''
@@ -490,13 +444,11 @@ def main():
         total_variance.assign(total_variance / samples_count)
         return total_mean, total_variance
 
-    """
     print('\nComputing mean and variance across (augmented) training dataset')
     mean, variance = compute_normalization_params(dataset_train)
     print(f'Computed mean {mean} and variance {variance} for the training dataset.')
     pre_trained.layers[2].mean.assign(mean)
     pre_trained.layers[2].variance.assign(variance)
-    """
 
     def display_by_batch(dataset):
         batch_iter = iter(dataset)
@@ -533,6 +485,8 @@ def main():
                                                           histogram_freq=1,
                                                           profile_batch=(1, min(train_batches_per_epoch, 16)))
 
+    # batch_iter = iter(dataset_val)
+    # batch = next(batch_iter)
     history = model.fit(dataset_train,
                         epochs=epochs,
                         validation_data=dataset_val,
@@ -555,7 +509,7 @@ def main():
     print(f'\nLogging in directory {log_dir_ft}')
     tensorboard_callback_ft = tf.keras.callbacks.TensorBoard(log_dir=log_dir_ft,
                                                              histogram_freq=1,
-                                                             profile_batch=0)
+                                                             profile_batch=(1, min(train_batches_per_epoch, 16)))
 
     history_ft = model.fit(dataset_train,
                            epochs=epochs_ft,
@@ -569,9 +523,8 @@ if __name__ == '__main__':
     main()
 
 ''' TODO:
-Image augmentation
+After saving augmented files, delete unnecessary variables
 Take pre-processing at batch level
 Try detection
-Try caching in the pipeline and run it through the profiler
 Try another NN (e.g. DenseNet) and also train it from scratch (no transfer learning)  
 '''
