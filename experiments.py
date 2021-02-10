@@ -26,7 +26,7 @@ grouped = metadata.groupby(['image_id', 'class_id'])['rad_id'].value_counts()
 images_ids = pd.Index(metadata['image_id'].unique())  # Using a pd.Index to speed-up look-up of values
 n_samples = len(images_ids)
 y = np.zeros((n_samples, 15),
-             dtype=int)  # The ground truth, i.e. the diagnosis for every x-ray image    y_df['weights'] = samples_weight
+             dtype=int)  # The ground truth, i.e. the diagnosis for every x-ray image
 
 for ((image_id, class_id, rad_id), _) in grouped.iteritems():
     y[images_ids.get_loc(image_id), class_id] += 1
