@@ -26,7 +26,7 @@ def main():
     limit_samples = None
     train_batch_size = 24
     val_batch_size = 32
-    epochs = 25  # Number of epochs to run with the base network frozen (for transfer learning)
+    epochs = 20  # Number of epochs to run with the base network frozen (for transfer learning)
     epochs_ft = 100  # Number of epochs to run for fine-tuning
     vis_batches = False
     print_base_model_summary = False
@@ -401,8 +401,7 @@ def main():
         model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
             loss=tf.keras.losses.BinaryCrossentropy(from_logits=False),
-            metrics=[tf.keras.metrics.BinaryAccuracy(name='binary_accuracy'),
-                     tf.keras.metrics.Precision(name='precision'),
+            metrics=[tf.keras.metrics.Precision(name='precision'),
                      tf.keras.metrics.Recall(name='recall'),
                      tf.keras.metrics.AUC(multi_label=True, name='auc')])
         return model
@@ -431,7 +430,6 @@ def main():
         images[i] = plt.imread(file_name)"""
 
     def load_grayscale_image(file_name, *params):
-        # TODO consider returning the image in the range [0,1] already, and change the way it is fed to the model
         image = tf.io.read_file(file_name)
         image = tf.io.decode_png(image)
         image = tf.cast(image, dtype=tf.float32)
@@ -455,7 +453,6 @@ def main():
     overall_sum = stats_pipeline.reduce(tf.constant(0, dtype=tf.float32), lambda a, b: a + b)
     var_by_pixel = overall_sum / (len(metadata_train) * input_res[0] * input_res[1] - 1)
 
-    # mean, variance = compute_normalization_params(dataset_train)
     print(f'Computed mean {mean_by_pixel.numpy()} and variance {var_by_pixel.numpy()} for the training dataset.')
     mean_by_pixel = tf.concat([mean_by_pixel] * 3, axis=0)
     pre_trained.layers[2].mean.assign(mean_by_pixel)
@@ -492,15 +489,46 @@ def main():
     log_dir = 'logs/' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     print(f'\nLogging training with frozen base model to directory {log_dir}')
     train_batches_per_epoch = ceil(len(metadata_train) / train_batch_size)
-    tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir,
-                                                          histogram_freq=1,
-                                                          profile_batch=(1, min(train_batches_per_epoch, 16)))
+    tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir=log_dir,
+                                                    histogram_freq=1,
+                                                    profile_batch=(1, min(train_batches_per_epoch, 16)))
+
+    class CheckpointBestModel(tf.keras.callbacks.Callback):
+        def __init__(self, file_name_stem, metric_key, optimization_direction):
+            super(CheckpointBestModel, self).__init__()
+            assert optimization_direction in ['min', 'max']
+            self.optimization_direction = optimization_direction
+            self.metric_key = metric_key
+            self.best_so_far = float('inf') if optimization_direction == 'min' else float('-inf')
+            self.epoch = 1
+            self.best_epoch = None
+            self.model_file_name = None
+            self.file_name_stem = file_name_stem
+
+        def on_epoch_end(self, epoch, logs=None):
+            metric_value = logs[self.metric_key]
+            if (self.optimization_direction == 'max' and metric_value > self.best_so_far) or \
+                    (self.optimization_direction == 'min' and metric_value < self.best_so_far):
+                self.best_so_far = metric_value
+                self.best_epoch = self.epoch
+                new_model_file_name = self.file_name_stem + f'-{self.epoch}.h5'
+                print(
+                    f'Best epoch so far {self.best_epoch} with {self.optimization_direction} {self.metric_key} = {self.best_so_far} -Saving model in file {new_model_file_name}')
+                self.model.save(new_model_file_name)
+                if self.model_file_name is not None:
+                    Path(self.model_file_name).unlink()
+                self.model_file_name = new_model_file_name
+            self.epoch += 1
+
+    checkpoint_cb = CheckpointBestModel(file_name_stem='base_model',
+                                        metric_key='val_auc',
+                                        optimization_direction='max')
 
     history = model.fit(dataset_train,
                         epochs=epochs,
                         validation_data=dataset_val,
                         shuffle=False,  # Shuffling is already done on the dataset before it is being fed to fit()
-                        callbacks=[tensorboard_callback],
+                        callbacks=[tensorboard_cb, checkpoint_cb],
                         verbose=1)
 
     # Un-freeze the weights of the base model to fine tune. Also see https://bit.ly/2YnJwqg
@@ -519,11 +547,15 @@ def main():
                                                              histogram_freq=1,
                                                              profile_batch=(1, min(train_batches_per_epoch, 16)))
 
+    checkpoint_cb_ft = CheckpointBestModel(file_name_stem='fine_tuned_model',
+                                           metric_key='val_auc',
+                                           optimization_direction='max')
+
     history_ft = model.fit(dataset_train,
                            epochs=epochs_ft,
                            validation_data=dataset_val,
                            shuffle=False,  # Shuffling is already done on the dataset before it is being fed to fit()
-                           callbacks=[tensorboard_callback_ft],
+                           callbacks=[tensorboard_callback_ft, checkpoint_cb_ft],
                            verbose=1)
 
 
@@ -531,7 +563,12 @@ if __name__ == '__main__':
     main()
 
 ''' TODO:
-Try caching at the end (or almost) of the validation pipeline, keeping images in memory
+Test on test dataset
+Learning rate annealing
+Save best model so far
+Optimization of hyper-parameters
+Early stop
+Resuming an interrupted computation
 Convert images from grayscale to RGB in batches
 Try detection
 Try another NN (e.g. DenseNet) and also train it from scratch (no transfer learning)  
