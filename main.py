@@ -23,10 +23,10 @@ def main():
     input_res = (224, 224)
     n_classes = 1  # Samples will be classified among the n_classes most frequent classes in the dataset
     assert n_classes <= 14
-    limit_samples = None
-    train_batch_size = 24
-    val_batch_size = 32
-    epochs = 20  # Number of epochs to run with the base network frozen (for transfer learning)
+    limit_samples = 64
+    train_batch_size = 8
+    val_batch_size = 16
+    epochs_base_model = 20  # Number of epochs to run with the base network frozen (for transfer learning)
     epochs_ft = 100  # Number of epochs to run for fine-tuning
     vis_batches = False
     print_base_model_summary = False
@@ -397,17 +397,6 @@ def main():
 
     print_trainable_layers(model)
 
-    def compile_model(model, learning_rate):
-        model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
-            loss=tf.keras.losses.BinaryCrossentropy(from_logits=False),
-            metrics=[tf.keras.metrics.Precision(name='precision'),
-                     tf.keras.metrics.Recall(name='recall'),
-                     tf.keras.metrics.AUC(multi_label=True, name='auc')])
-        return model
-
-    model = compile_model(model, learning_rate=1.5e-4)
-
     dataset_train = make_pipeline(file_names=metadata_train['image_id'],
                                   y=metadata_train[variable_labels],
                                   weights=metadata_train['weights'],
@@ -486,13 +475,6 @@ def main():
     if vis_batches:
         display_by_batch(dataset_train)
 
-    log_dir = 'logs/' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    print(f'\nLogging training with frozen base model to directory {log_dir}')
-    train_batches_per_epoch = ceil(len(metadata_train) / train_batch_size)
-    tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir=log_dir,
-                                                    histogram_freq=1,
-                                                    profile_batch=(1, min(train_batches_per_epoch, 16)))
-
     class CheckpointBestModel(tf.keras.callbacks.Callback):
         def __init__(self, file_name_stem, metric_key, optimization_direction):
             super(CheckpointBestModel, self).__init__()
@@ -520,26 +502,65 @@ def main():
                 self.model_file_name = new_model_file_name
             self.epoch += 1
 
-    checkpoint_cb = CheckpointBestModel(file_name_stem='base_model',
-                                        metric_key='val_auc',
-                                        optimization_direction='max')
+    def compile_model(model, learning_rate):
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+            loss=tf.keras.losses.BinaryCrossentropy(from_logits=False),
+            metrics=[tf.keras.metrics.Precision(name='precision'),
+                     tf.keras.metrics.Recall(name='recall'),
+                     tf.keras.metrics.AUC(multi_label=True, name='auc')])
+        return model
 
-    history = model.fit(dataset_train,
-                        epochs=epochs,
-                        validation_data=dataset_val,
-                        shuffle=False,  # Shuffling is already done on the dataset before it is being fed to fit()
-                        callbacks=[tensorboard_cb, checkpoint_cb],
-                        verbose=1)
+    def run_exp(model, epochs, learning_rate, file_name_stem):
+
+        model = compile_model(model, learning_rate=learning_rate)
+
+        log_dir = 'logs/' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        print(f'\nLogging training and validation to directory {log_dir}')
+        # train_batches_per_epoch = ceil(len(dataset_train) / train_batch_size)
+        tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir=log_dir,
+                                                        histogram_freq=1,
+                                                        profile_batch=(1, 8))
+
+        checkpoint_cb = CheckpointBestModel(file_name_stem=file_name_stem,
+                                            metric_key='val_auc',
+                                            optimization_direction='max')
+
+        early_stopping_cb = tf.keras.callbacks.EarlyStopping(monitor='val_loss',
+                                                             patience=100,
+                                                             verbose=1,
+                                                             mode='min',
+                                                             restore_best_weights=False)
+
+        history = model.fit(dataset_train,
+                            epochs=epochs,
+                            validation_data=dataset_val,
+                            shuffle=False,  # Shuffling is already done on the dataset before it is being fed to fit()
+                            callbacks=[tensorboard_cb, checkpoint_cb, early_stopping_cb],
+                            verbose=1)
+
+        # Careful: remember to set argmax/argmin below properly, based on the optimization direction of the metric
+        best_epoch = np.argmax(history.history['val_auc'])
+        assert (history.epoch[best_epoch] == best_epoch)
+        best_epoch_metric = history.history['val_auc'][best_epoch]
+
+        # Hyperopt will minimize the return value below
+        return -best_epoch_metric
+
+    print('\nTraining and validating base model.')
+    run_exp(model, epochs=epochs_base_model, learning_rate=1.5e-4, file_name_stem='base_model')
+
+    print('\nFine-tuning and validating model.')
 
     # Un-freeze the weights of the base model to fine tune. Also see https://bit.ly/2YnJwqg
-    print('\nFine-tuning the model.')
     pre_trained.trainable = True
-
     print_trainable_layers(model)
-    print()
 
+    run_exp(model, epochs=epochs_ft, learning_rate=3e-6, file_name_stem='fine_tuned_model')
     # Because of the change in frozen layers, need to recompile the model
-    model = compile_model(model, learning_rate=3e-6)
+    """model = compile_model(model, learning_rate=3e-6)
+
+    train_batches_per_epoch = ceil(len(metadata_train) / train_batch_size)
 
     log_dir_ft = 'logs/' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     print(f'\nLogging fine-tuning to directory {log_dir_ft}')
@@ -551,23 +572,30 @@ def main():
                                            metric_key='val_auc',
                                            optimization_direction='max')
 
+    early_stopping_cb_ft = tf.keras.callbacks.EarlyStopping(monitor='val_loss',
+                                                            patience=100,
+                                                            verbose=1,
+                                                            mode='min',
+                                                            restore_best_weights=False)
+
     history_ft = model.fit(dataset_train,
                            epochs=epochs_ft,
                            validation_data=dataset_val,
                            shuffle=False,  # Shuffling is already done on the dataset before it is being fed to fit()
-                           callbacks=[tensorboard_callback_ft, checkpoint_cb_ft],
+                           callbacks=[tensorboard_callback_ft, checkpoint_cb_ft, early_stopping_cb_ft],
                            verbose=1)
+                           """
 
 
 if __name__ == '__main__':
     main()
 
 ''' TODO:
+Verify proper metrics for multi-label problems
+Make the pipelines deterministic, check if any performance hit
 Test on test dataset
-Learning rate annealing
-Save best model so far
+Try a decaying learning rate (learning rate annealing)
 Optimization of hyper-parameters
-Early stop
 Resuming an interrupted computation
 Convert images from grayscale to RGB in batches
 Try detection
