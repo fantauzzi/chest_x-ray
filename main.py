@@ -12,6 +12,8 @@ import pickle
 import random
 from tqdm import tqdm
 
+from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
+
 
 def main():
     seed = 42
@@ -23,11 +25,14 @@ def main():
     input_res = (224, 224)
     n_classes = 1  # Samples will be classified among the n_classes most frequent classes in the dataset
     assert n_classes <= 14
-    limit_samples = 64
-    train_batch_size = 8
-    val_batch_size = 16
-    epochs_base_model = 20  # Number of epochs to run with the base network frozen (for transfer learning)
-    epochs_ft = 100  # Number of epochs to run for fine-tuning
+    limit_samples = 1000
+    # train_batch_size = 8
+    train_batch_sizes = [8, 16, 24, 32, 48, 64]
+    val_batch_size = 64
+    epochs_base_model = 10  # Number of epochs to run with the base network frozen (for transfer learning)
+    max_evals = 5
+    max_evals_ft = 5
+    epochs_ft = 30  # Number of epochs to run for fine-tuning
     vis_batches = False
     print_base_model_summary = False
     p_test = .15  # Proportion of the dataset to be held out for test (test set)
@@ -38,8 +43,7 @@ def main():
 
     aug_param_labels = ['zoom_x', 'zoom_y', 'shear', 'translate_x', 'translate_y']
 
-    print(
-        f'Input resolution {input_res}\nTraining batch size {train_batch_size}\nValidation batch size {val_batch_size}')
+    print(f'Input resolution {input_res}\nValidation batch size {val_batch_size}')
     # Load the datasets metadata in dataframes
     dataset_root = '/mnt/storage/datasets/vinbigdata'
     metadata_pickle_fname = dataset_root + '/metadata.pickle'
@@ -274,27 +278,29 @@ def main():
     print(f'Validation set contains {len(metadata_val)} samples.')
     print(f'Test set contains {len(metadata_test)} samples.')
 
-    """ Compute training sample weights, and add them as a new column to the dataframe. The sequence of labels (1 and 0) 
-    for each sample are interpreted as a binary number, which becomes a "class" for the given sample, for the 
-    purpose of calculating the sample weight. If the obtained "class" appears in the training dataset p times, and the 
-    dataset contains N samples overall, then the weight for the given samples is set to (N-p)/N.
-    TODO: could samples with very rare "class" get a weight so high to screw the gradient of the loss? """
+    def compute_sample_weights(metadata, variable_labels):
+        """ Compute training sample weights, and add them as a new column to the dataframe. The sequence of labels (1 and 0)
+        for each sample are interpreted as a binary number, which becomes a "class" for the given sample, for the
+        purpose of calculating the sample weight. If the obtained "class" appears in the training dataset p times, and the
+        dataset contains N samples overall, then the weight for the given samples is set to (N-p)/N.
+        TODO: could samples with very rare "class" get a weight so high to screw the gradient of the loss? """
 
-    def convert_to_int_class(row):
-        int_value = 0
-        for i, item in enumerate(row):
-            pos = len(row) - i - 1
-            int_value += item * (2 ** pos)
-        return int_value
+        def convert_to_int_class(row):
+            int_value = 0
+            for i, item in enumerate(row):
+                pos = len(row) - i - 1
+                int_value += item * (2 ** pos)
+            return int_value
 
-    int_class = metadata_train[variable_labels].apply(convert_to_int_class, axis=1)
-    int_class_counts = int_class.value_counts()
-    metadata_count = int_class.apply(lambda item: int_class_counts[item])
-    metadata_train['weights'] = (sum(int_class_counts) - metadata_count) / sum(int_class_counts)
+        int_class = metadata[variable_labels].apply(convert_to_int_class, axis=1)
+        int_class_counts = int_class.value_counts()
+        metadata_count = int_class.apply(lambda item: int_class_counts[item])
+        metadata['weights'] = (sum(int_class_counts) - metadata_count) / sum(int_class_counts)
 
-    print(f'\nFound {len(int_class_counts)} class combinations while assigning weights to training samples.')
-    print(f'Most occurring class combination in training dataset appears {int_class_counts.max()} times.')
-    print(f'Least occurring class combination in training dataset appears {int_class_counts.min()} time(s).')
+        print(f'\nFound {len(int_class_counts)} class combinations while assigning weights to training samples.')
+        print(f'Most occurring class combination in training dataset appears {int_class_counts.max()} times.')
+        print(f'Least occurring class combination in training dataset appears {int_class_counts.min()} time(s).')
+        return metadata['weights']
 
     def load_image(file_name, *params):
         # TODO consider returning the image in the range [0,1] already, and change the way it is fed to the model
@@ -322,6 +328,7 @@ def main():
 
         return dataset
 
+    metadata_train['weights'] = compute_sample_weights(metadata_train, variable_labels)
     # Show a couple images from a pipeline, along with their GT, as a sanity check
     n_cols = 4
     n_rows = ceil(16 / n_cols)
@@ -397,19 +404,6 @@ def main():
 
     print_trainable_layers(model)
 
-    dataset_train = make_pipeline(file_names=metadata_train['image_id'],
-                                  y=metadata_train[variable_labels],
-                                  weights=metadata_train['weights'],
-                                  batch_size=train_batch_size,
-                                  shuffle=True,
-                                  for_model=True)
-    dataset_val = make_pipeline(file_names=metadata_val['image_id'],
-                                y=metadata_val[variable_labels],
-                                weights=None,
-                                batch_size=val_batch_size,
-                                shuffle=False,
-                                for_model=True)
-
     ''' Calculate mean and variance of each image channel across the training set, and set them in the normalization
     layer of the pre-trained model '''
 
@@ -472,8 +466,8 @@ def main():
         plt.draw()
         plt.pause(.01)
 
-    if vis_batches:
-        display_by_batch(dataset_train)
+    # if vis_batches:
+    #    display_by_batch(dataset_train)
 
     class CheckpointBestModel(tf.keras.callbacks.Callback):
         def __init__(self, file_name_stem, metric_key, optimization_direction):
@@ -482,7 +476,7 @@ def main():
             self.optimization_direction = optimization_direction
             self.metric_key = metric_key
             self.best_so_far = float('inf') if optimization_direction == 'min' else float('-inf')
-            self.epoch = 1
+            self.epoch = 0  # Epochs are numbered starting from 0, consistent with Tensorboard
             self.best_epoch = None
             self.model_file_name = None
             self.file_name_stem = file_name_stem
@@ -494,8 +488,8 @@ def main():
                 self.best_so_far = metric_value
                 self.best_epoch = self.epoch
                 new_model_file_name = self.file_name_stem + f'-{self.epoch}.h5'
-                print(
-                    f'Best epoch so far {self.best_epoch} with {self.optimization_direction} {self.metric_key} = {self.best_so_far} -Saving model in file {new_model_file_name}')
+                # print(
+                #     f'Best epoch so far {self.best_epoch} with {self.optimization_direction} {self.metric_key} = {self.best_so_far} -Saving model in file {new_model_file_name}')
                 self.model.save(new_model_file_name)
                 if self.model_file_name is not None:
                     Path(self.model_file_name).unlink()
@@ -511,18 +505,46 @@ def main():
                      tf.keras.metrics.AUC(multi_label=True, name='auc')])
         return model
 
-    def run_exp(model, epochs, learning_rate, file_name_stem):
+    def run_exp(params):  # TODO parameters that are not hyper: closure or pass them?
+        model, train_batch_size, epochs, learning_rate, file_name_stem, trials, metadata_train, metadata_val = [
+            params[key] for key in
+            ('model',
+             'train_batch_size',
+             'epochs',
+             'learning_rate',
+             'file_name_stem',
+             'trials',
+             'metadata_train',
+             'metadata_val')]
 
+        trial_idx = len(trials.trials) - 1 if trials is not None else 0
+        print(f'\nRunning experiment {trial_idx + 1}/{max_evals} with parameters:')
+        for key, value in params.items():
+            if key not in ('trials', 'metadata_train', 'metadata_val'):
+                print(f'{key} = {value}')
+
+        dataset_train = make_pipeline(file_names=metadata_train['image_id'],
+                                      y=metadata_train[variable_labels],
+                                      weights=metadata_train['weights'],
+                                      batch_size=train_batch_size,
+                                      shuffle=True,
+                                      for_model=True)
+
+        dataset_val = make_pipeline(file_names=metadata_val['image_id'],
+                                    y=metadata_val[variable_labels],
+                                    weights=None,
+                                    batch_size=val_batch_size,
+                                    shuffle=False,
+                                    for_model=True) if metadata_val is not None else None
         model = compile_model(model, learning_rate=learning_rate)
 
         log_dir = 'logs/' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         print(f'\nLogging training and validation to directory {log_dir}')
-        # train_batches_per_epoch = ceil(len(dataset_train) / train_batch_size)
         tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir=log_dir,
                                                         histogram_freq=1,
                                                         profile_batch=(1, 8))
 
-        checkpoint_cb = CheckpointBestModel(file_name_stem=file_name_stem,
+        checkpoint_cb = CheckpointBestModel(file_name_stem=file_name_stem + f'-{trial_idx}',
                                             metric_key='val_auc',
                                             optimization_direction='max')
 
@@ -531,60 +553,124 @@ def main():
                                                              verbose=1,
                                                              mode='min',
                                                              restore_best_weights=False)
-
+        callbacks = [tensorboard_cb] if metadata_val is None else [tensorboard_cb,
+                                                                   checkpoint_cb,
+                                                                   early_stopping_cb]
         history = model.fit(dataset_train,
                             epochs=epochs,
                             validation_data=dataset_val,
                             shuffle=False,  # Shuffling is already done on the dataset before it is being fed to fit()
-                            callbacks=[tensorboard_cb, checkpoint_cb, early_stopping_cb],
+                            callbacks=callbacks,
                             verbose=1)
 
-        # Careful: remember to set argmax/argmin below properly, based on the optimization direction of the metric
-        best_epoch = np.argmax(history.history['val_auc'])
-        assert (history.epoch[best_epoch] == best_epoch)
-        best_epoch_metric = history.history['val_auc'][best_epoch]
+        # Careful: keep argmax/argmin below set properly, based on the optimization direction of the metric
+        if metadata_val is None:
+            best_epoch = None
+            best_epoch_metric = float('NaN')
+        else:
+            best_epoch = np.argmax(history.history['val_auc'])
+            assert best_epoch == checkpoint_cb.best_epoch
+            assert (history.epoch[best_epoch] == best_epoch)
+            best_epoch_metric = history.history['val_auc'][best_epoch]
 
         # Hyperopt will minimize the return value below
-        return -best_epoch_metric
+        res = {'status': STATUS_OK,
+               'loss': -best_epoch_metric,
+               'history': history,
+               'model_file_name': checkpoint_cb.model_file_name}
+        return res
 
-    print('\nTraining and validating base model.')
-    run_exp(model, epochs=epochs_base_model, learning_rate=1.5e-4, file_name_stem='base_model')
+    trials = Trials()
 
+    params_space = {
+        'learning_rate': hp.loguniform('learning_rate', np.log(1e-4), np.log(1e-3)),
+        'model': model,
+        'train_batch_size': hp.choice('train_batch_size', train_batch_sizes),
+        'epochs': epochs_base_model,
+        'file_name_stem': 'base_model',
+        'trials': trials,
+        'metadata_train': metadata_train,
+        'metadata_val': metadata_val}
+
+    best = fmin(fn=run_exp,
+                space=params_space,
+                algo=tpe.suggest,
+                max_evals=max_evals,
+                trials=trials,
+                show_progressbar=False,
+                rstate=np.random.RandomState(seed))
+
+    best_trial_idx = np.argmin([result['loss'] for result in trials.results])
+    base_model_fname = trials.best_trial['result']['model_file_name']
+    print(
+        f'Reloading best model from file {base_model_fname} obtained during experiment {best_trial_idx + 1}/{max_evals}')
+    model = tf.keras.models.load_model(base_model_fname)
+    # run_exp(model, epochs=epochs_base_model, learning_rate=1.5e-4, file_name_stem='base_model')
     print('\nFine-tuning and validating model.')
 
     # Un-freeze the weights of the base model to fine tune. Also see https://bit.ly/2YnJwqg
     pre_trained.trainable = True
     print_trainable_layers(model)
 
-    run_exp(model, epochs=epochs_ft, learning_rate=3e-6, file_name_stem='fine_tuned_model')
-    # Because of the change in frozen layers, need to recompile the model
-    """model = compile_model(model, learning_rate=3e-6)
+    trials_ft = Trials()
 
-    train_batches_per_epoch = ceil(len(metadata_train) / train_batch_size)
+    params_space_ft = {
+        'learning_rate': hp.loguniform('learning_rate', np.log(1e-4), np.log(1e-3)),
+        'model': model,
+        'train_batch_size': hp.choice('train_batch_size', train_batch_sizes),
+        'epochs': epochs_ft,
+        'file_name_stem': 'fine_tuned_model',
+        'trials': trials_ft,
+        'metadata_train': metadata_train,
+        'metadata_val': metadata_val}
 
-    log_dir_ft = 'logs/' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    print(f'\nLogging fine-tuning to directory {log_dir_ft}')
-    tensorboard_callback_ft = tf.keras.callbacks.TensorBoard(log_dir=log_dir_ft,
-                                                             histogram_freq=1,
-                                                             profile_batch=(1, min(train_batches_per_epoch, 16)))
+    best_ft = fmin(fn=run_exp,
+                   space=params_space_ft,
+                   algo=tpe.suggest,
+                   max_evals=max_evals_ft,
+                   trials=trials_ft,
+                   show_progressbar=False,
+                   rstate=np.random.RandomState(seed))
 
-    checkpoint_cb_ft = CheckpointBestModel(file_name_stem='fine_tuned_model',
-                                           metric_key='val_auc',
-                                           optimization_direction='max')
+    best_trial_idx_ft = np.argmin([result['loss'] for result in trials_ft.results])
+    ft_model_fname = trials_ft.best_trial['result']['model_file_name']
+    print(
+        f'\nReloading best fine-tuned model from file {ft_model_fname} obtained during experiment {best_trial_idx_ft + 1}/{max_evals_ft}')
+    model = tf.keras.models.load_model(ft_model_fname)
+    print('Retraining it on the whole trainig+validation dataset, for testing and inference.')
+    metadata_dev = metadata_train.append(metadata_val)
+    metadata_dev['weights'] = compute_sample_weights(metadata_dev, variable_labels)
 
-    early_stopping_cb_ft = tf.keras.callbacks.EarlyStopping(monitor='val_loss',
-                                                            patience=100,
-                                                            verbose=1,
-                                                            mode='min',
-                                                            restore_best_weights=False)
+    params_space_dev = {'learning_rate': best_ft['learning_rate'],
+                        'model': model,
+                        'train_batch_size': train_batch_sizes[best_ft['train_batch_size']],
+                        'epochs': np.argmax(trials_ft.best_trial['result']['history'].history['val_auc']) + 1,
+                        'file_name_stem': 'final_model',
+                        'trials': None,
+                        'metadata_train': metadata_dev,
+                        'metadata_val': None}
 
-    history_ft = model.fit(dataset_train,
-                           epochs=epochs_ft,
-                           validation_data=dataset_val,
-                           shuffle=False,  # Shuffling is already done on the dataset before it is being fed to fit()
-                           callbacks=[tensorboard_callback_ft, checkpoint_cb_ft, early_stopping_cb_ft],
-                           verbose=1)
-                           """
+    res = run_exp(params_space_dev)
+    print(f"Final model re-trained with loss {res['history'].history['loss'][-1]} and AUC {res['history'].history['auc'][-1]}")
+
+    dataset_eval = make_pipeline(metadata_test['image_id'],
+                                 y=metadata_test[variable_labels],
+                                 weights=None,
+                                 batch_size=val_batch_size,
+                                 shuffle=False,
+                                 for_model=True)
+
+    log_dir = 'logs/' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    print(f'\nLogging training to directory {log_dir}')
+    tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir=log_dir,
+                                                    histogram_freq=1,
+                                                    profile_batch=0)
+
+    test_result = model.evaluate(dataset_eval,
+                             callbacks=[tensorboard_cb],
+                             return_dict = True,
+                             verbose=1)
+    print(test_result)
 
 
 if __name__ == '__main__':
