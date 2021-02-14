@@ -16,29 +16,36 @@ from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
 
 
 def main():
+    str_time = datetime.datetime.now().strftime("%m%d-%H%M%S")
     seed = 42
     random.seed(seed)
-    ''' gpu_private is bad idea! Batching would only run on a few of the available threads, under-utilizing the CPU '''
-    # os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
+    dataset_root = '/mnt/storage/datasets/vinbigdata'
+    train_dir = dataset_root + '/train'
+    aug_dir = dataset_root + '/aug-train'  # Where generated augmented images will be stored
+    logs_root = './logs'  # Logs for Tensorboard will be organized in subdirs. within this dir.
+    models_root = './models'
     ''' For input resolution, check here, based on the choice of EfficientNet:
      https://keras.io/examples/vision/image_classification_efficientnet_fine_tuning/ '''
     input_res = (224, 224)
-    n_classes = 1  # Samples will be classified among the n_classes most frequent classes in the dataset
+    n_classes = 3  # Samples will be classified among the n_classes most frequent classes in the dataset
     assert n_classes <= 14
-    limit_samples = 1000
-    # train_batch_size = 8
+    # Can use the whole dataset, setting limit_samples to None, or a subset of it, of size limit_samples.
+    limit_samples = 100
+    # List of batch sizes for training to choose from during hyper-parameters tuning
     train_batch_sizes = [8, 16, 24, 32, 48, 64]
-    val_batch_size = 64
-    epochs_base_model = 10  # Number of epochs to run with the base network frozen (for transfer learning)
-    max_evals = 5
-    max_evals_ft = 5
-    epochs_ft = 30  # Number of epochs to run for fine-tuning
+    val_batch_size = 64  # Batch size used for validation and also test
+    ''' Number of experiments to be run for tuning of hyper-parameters of the base model and of fine tuning 
+    respectively'''
+    runs = 3  # Number of experiments to be run gor
+    runs_ft = 3
+    epochs_base_model = 10  # Max number of epochs with the base network frozen (for transfer learning)
+    epochs_ft = 20  # Max number of epochs for fine-tuning
+    ''' Set to true to display all the (augmented or not) training samples in a grid, one line per batch. Samples
+    are shown the way they would be just before being fed to the model. Should be used in conjunction with 
+    limit_samples'''
     vis_batches = False
     print_base_model_summary = False
     p_test = .15  # Proportion of the dataset to be held out for test (test set)
-    ''' The number of samples from the dataset to be used for training, validation and test of the model. Set to None
-    to use all of the available samples. Used to make quick experiments on a small subset of the datasert '''
-    # If True, display all the training dataset being fed to the model , one row of pictures per batch, before training
     model_choice = tf.keras.applications.EfficientNetB0
 
     aug_param_labels = ['zoom_x', 'zoom_y', 'shear', 'translate_x', 'translate_y']
@@ -49,19 +56,20 @@ def main():
     metadata_pickle_fname = dataset_root + '/metadata.pickle'
 
     metadata = pd.read_csv(Path(dataset_root + '/train.csv'))
-    # test.csv is for a Kaggle competition, no GT available
+    # test.csv is for a Kaggle competition, no GT available. No need to load it here.
     # test_metadata = pd.read_csv(Path(dataset_root + '/test.csv'))
 
     """ Process the dataset to assign, to each x-ray, one or more diagnosis, based on a majority vote among the 
-    radiologists. If at least 2 radiologists out of 3 have given a same diagnosis to a given x-ray, then the 
-    diagnosis is assigned to the given x-ray. If at least 2 radiologists out of 2 have assigned 'no finding' to the
+    radiologists. If at least 2 radiologists out of 3 have given the same diagnosis to a given x-ray, then the 
+    diagnosis is assigned to the x-ray. If at least 2 radiologists out of 2 have assigned 'no finding' to the
     x-ray, then the x-ray is assigned 'no finding'. If there is no consensus on any diagnosis nor on 'no finding', then 
     set 'no finding' to 1. As a consequence, each x-ray is either assigned 'no finding' or at least one diagnosis. """
+
     grouped = metadata.groupby(['image_id', 'class_id'])['rad_id'].value_counts()
     images_ids = pd.Index(metadata['image_id'].unique())  # Using a pd.Index to speed-up look-up of values
     n_samples = len(images_ids)
-    y = np.zeros((n_samples, 15),
-                 dtype=int)  # The ground truth, i.e. the diagnosis for every x-ray image
+    # Will hold the ground truth to be used for model training, the diagnosis for every x-ray image
+    y = np.zeros((n_samples, 15), dtype=int)
 
     for ((image_id, class_id, rad_id), _) in grouped.iteritems():
         y[images_ids.get_loc(image_id), class_id] += 1
@@ -87,21 +95,22 @@ def main():
     # Convert the obtained ground truth to a dataframe, and add a column with the image file names
     metadata_df = pd.DataFrame(y)
 
-    # Remove columns related to classes that won't be used
+    # Remove columns related to classes that won't be used (if any)
     metadata_df.drop(classes_by_freq[:len(classes_by_freq) - n_classes], axis=1, inplace=True)
 
     ''' Rebuild the column for class 14, i.e. 'no finding': iff the sample doesn't belong to any of the classes, then
     it belongs to class 14. Note that a 1 in this columns doesn't necessarily mean that radiologists gave a 
-    'no finding' diagnose for the sample.'''
+    'no finding' diagnose for the sample, it may be just lack of consensus.'''
 
-    metadata_df.drop(14, axis=1, inplace=True)
     ''' Store the labels for the columns corresponding to dataset variables, will be used for training. These must
-    not include column 14. '''
+    not include column 14. Also rebuild column 14, as its content may have been invalidated by dropping columns
+    related to classes that won't be used'''
+    metadata_df.drop(14, axis=1, inplace=True)
     variable_labels = metadata_df.columns
     metadata_df[14] = pd.Series(metadata_df.sum(axis=1) == 0, dtype=int)
 
     # Add a column with the image file name
-    metadata_df['image_id'] = dataset_root + '/train/' + images_ids + '.jpg'
+    metadata_df['image_id'] = train_dir + '/' + images_ids + '.jpg'
 
     # Limit the size of the dataset if required (variable `limit_samples`) and shuffle it.
     if limit_samples is None:
@@ -131,9 +140,9 @@ def main():
     if not device_name:
         print('GPU not found')
     else:
-        print('Found GPU at: {}'.format(device_name))
+        print('Found GPU at: f{device_name}')
 
-    def draw_augmentation(sample):
+    def make_augmented_metadata(sample):
         max_zoom = .15
         max_shear = 10
         max_translate_x = .05
@@ -146,7 +155,7 @@ def main():
         augmented['translate_y'] = random.uniform(-max_translate_y, max_translate_y)
         ''' File name  of the augmented image is obtained from the original image file name, appending '_01' to its 
         stem; augmented images go to their own directory. '''
-        augmented['aug_image_id'] = dataset_root + '/aug-train/' + Path(sample['image_id']).stem + '_01.png'
+        augmented['aug_image_id'] = aug_dir + '/' + Path(sample['image_id']).stem + '_01.png'
         return augmented
 
     def load_sample(file_name, *params):
@@ -164,7 +173,7 @@ def main():
 
         return (image, file_name) + params
 
-    def augment_sample(image, file_name, aug_file_name, y, augment_params):
+    def augment_image(image, file_name, aug_file_name, y, augment_params):
         side = float(tf.shape(image)[0])
         image_np = image.numpy()
         fill_mode = 'constant'
@@ -212,7 +221,7 @@ def main():
         dataset = dataset.map(load_sample, num_parallel_calls=tf.data.AUTOTUNE)
         dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
         dataset = dataset.map(
-            lambda *params: tf.py_function(func=augment_sample,
+            lambda *params: tf.py_function(func=augment_image,
                                            inp=params,
                                            Tout=[tf.float32, tf.string, tf.string, tf.int64, tf.float64]
                                            ),
@@ -233,7 +242,7 @@ def main():
 
     def get_preprocessed_file_names(file_names):
         res = file_names.apply(
-            lambda file_name: dataset_root + '/aug-train/' + Path(file_name).stem + '_00.png')
+            lambda file_name: aug_dir + '/' + Path(file_name).stem + '_00.png')
         return res
 
     if Path(metadata_pickle_fname).is_file():
@@ -253,7 +262,7 @@ def main():
             for _ in tqdm(preprocess_pipeline):
                 pass
         print('Making and saving augmented images for training.')
-        metadata_aug = metadata_train.apply(draw_augmentation, axis=1)
+        metadata_aug = metadata_train.apply(make_augmented_metadata, axis=1)
         aug_pipeline = make_aug_pipeline(file_names=metadata_aug['image_id'],
                                          y=metadata_aug[variable_labels],
                                          augment_params=metadata_aug[aug_param_labels],
@@ -375,11 +384,10 @@ def main():
     x = pre_trained(inputs)
     x = Dense(1280 // 2, activation='sigmoid', name='dense_1')(x)
     # x = tf.keras.layers.BatchNormalization()(x)
-    # TODO consider adding here batch normalization and additional final classification layers
     y_train_freq = metadata_train[variable_labels].sum(axis=0) / len(metadata_train)
     if min(y_train_freq) == 0:
         print(
-            'Some of the variables are never set to 1 in the training dataset. Increase the number of variables to be considered, or the number of samples.')
+            'Some of the variables are never set to 1 in the training dataset. Increase the number of training samples.')
         print(y_train_freq)
         exit(-1)
     bias_init = np.log(y_train_freq / (1 - y_train_freq)).to_numpy()
@@ -487,9 +495,9 @@ def main():
                     (self.optimization_direction == 'min' and metric_value < self.best_so_far):
                 self.best_so_far = metric_value
                 self.best_epoch = self.epoch
-                new_model_file_name = self.file_name_stem + f'-{self.epoch}.h5'
-                # print(
-                #     f'Best epoch so far {self.best_epoch} with {self.optimization_direction} {self.metric_key} = {self.best_so_far} -Saving model in file {new_model_file_name}')
+                new_model_file_name = models_root + '/'+str_time +'/' +self.file_name_stem + f'-{self.epoch}.h5'
+                print(
+                    f'Best epoch so far {self.best_epoch} with {self.optimization_direction} {self.metric_key} = {self.best_so_far} -Saving model in file {new_model_file_name}')
                 self.model.save(new_model_file_name)
                 if self.model_file_name is not None:
                     Path(self.model_file_name).unlink()
@@ -518,7 +526,7 @@ def main():
              'metadata_val')]
 
         trial_idx = len(trials.trials) - 1 if trials is not None else 0
-        print(f'\nRunning experiment {trial_idx + 1}/{max_evals} with parameters:')
+        print(f'\nRunning experiment {trial_idx + 1}/{runs} with parameters:')
         for key, value in params.items():
             if key not in ('trials', 'metadata_train', 'metadata_val'):
                 print(f'{key} = {value}')
@@ -538,7 +546,7 @@ def main():
                                     for_model=True) if metadata_val is not None else None
         model = compile_model(model, learning_rate=learning_rate)
 
-        log_dir = 'logs/' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        log_dir = logs_root + '/' + str_time + '/{}-{:03d}'.format(file_name_stem, trial_idx)
         print(f'\nLogging training and validation to directory {log_dir}')
         tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir=log_dir,
                                                         histogram_freq=1,
@@ -595,7 +603,7 @@ def main():
     best = fmin(fn=run_exp,
                 space=params_space,
                 algo=tpe.suggest,
-                max_evals=max_evals,
+                max_evals=runs,
                 trials=trials,
                 show_progressbar=False,
                 rstate=np.random.RandomState(seed))
@@ -603,7 +611,7 @@ def main():
     best_trial_idx = np.argmin([result['loss'] for result in trials.results])
     base_model_fname = trials.best_trial['result']['model_file_name']
     print(
-        f'Reloading best model from file {base_model_fname} obtained during experiment {best_trial_idx + 1}/{max_evals}')
+        f'Reloading best model from file {base_model_fname} obtained during experiment {best_trial_idx + 1}/{runs}')
     model = tf.keras.models.load_model(base_model_fname)
     # run_exp(model, epochs=epochs_base_model, learning_rate=1.5e-4, file_name_stem='base_model')
     print('\nFine-tuning and validating model.')
@@ -627,7 +635,7 @@ def main():
     best_ft = fmin(fn=run_exp,
                    space=params_space_ft,
                    algo=tpe.suggest,
-                   max_evals=max_evals_ft,
+                   max_evals=runs_ft,
                    trials=trials_ft,
                    show_progressbar=False,
                    rstate=np.random.RandomState(seed))
@@ -635,7 +643,7 @@ def main():
     best_trial_idx_ft = np.argmin([result['loss'] for result in trials_ft.results])
     ft_model_fname = trials_ft.best_trial['result']['model_file_name']
     print(
-        f'\nReloading best fine-tuned model from file {ft_model_fname} obtained during experiment {best_trial_idx_ft + 1}/{max_evals_ft}')
+        f'\nReloading best fine-tuned model from file {ft_model_fname} obtained during experiment {best_trial_idx_ft + 1}/{runs_ft}')
     model = tf.keras.models.load_model(ft_model_fname)
     print('Retraining it on the whole trainig+validation dataset, for testing and inference.')
     metadata_dev = metadata_train.append(metadata_val)
@@ -651,7 +659,8 @@ def main():
                         'metadata_val': None}
 
     res = run_exp(params_space_dev)
-    print(f"Final model re-trained with loss {res['history'].history['loss'][-1]} and AUC {res['history'].history['auc'][-1]}")
+    print(
+        f"Final model re-trained with loss {res['history'].history['loss'][-1]} and AUC {res['history'].history['auc'][-1]}")
 
     dataset_eval = make_pipeline(metadata_test['image_id'],
                                  y=metadata_test[variable_labels],
@@ -660,16 +669,17 @@ def main():
                                  shuffle=False,
                                  for_model=True)
 
-    log_dir = 'logs/' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    # log_dir = 'logs/' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_dir = logs_root + '/' + str_time + '/final_model_test'
     print(f'\nLogging training to directory {log_dir}')
     tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir=log_dir,
                                                     histogram_freq=1,
                                                     profile_batch=0)
 
     test_result = model.evaluate(dataset_eval,
-                             callbacks=[tensorboard_cb],
-                             return_dict = True,
-                             verbose=1)
+                                 callbacks=[tensorboard_cb],
+                                 return_dict=True,
+                                 verbose=1)
     print(test_result)
 
 
@@ -677,11 +687,10 @@ if __name__ == '__main__':
     main()
 
 ''' TODO:
+Ensure every experiment starts from the pre-trained weights or the traiend base model
 Verify proper metrics for multi-label problems
 Make the pipelines deterministic, check if any performance hit
-Test on test dataset
 Try a decaying learning rate (learning rate annealing)
-Optimization of hyper-parameters
 Resuming an interrupted computation
 Convert images from grayscale to RGB in batches
 Try detection
