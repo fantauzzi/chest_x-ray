@@ -27,19 +27,19 @@ def main():
     ''' For input resolution, check here, based on the choice of EfficientNet:
      https://keras.io/examples/vision/image_classification_efficientnet_fine_tuning/ '''
     input_res = (224, 224)
-    n_classes = 3  # Samples will be classified among the n_classes most frequent classes in the dataset
+    n_classes = 1  # Samples will be classified among the n_classes most frequent classes in the dataset
     assert n_classes <= 14
     # Can use the whole dataset, setting limit_samples to None, or a subset of it, of size limit_samples.
-    limit_samples = 100
+    limit_samples = None
     # List of batch sizes for training to choose from during hyper-parameters tuning
     train_batch_sizes = [8, 16, 24, 32, 48, 64]
     val_batch_size = 64  # Batch size used for validation and also test
     ''' Number of experiments to be run for tuning of hyper-parameters of the base model and of fine tuning 
     respectively'''
-    runs = 3  # Number of experiments to be run gor
-    runs_ft = 3
-    epochs_base_model = 10  # Max number of epochs with the base network frozen (for transfer learning)
-    epochs_ft = 20  # Max number of epochs for fine-tuning
+    runs = 20  # Number of experiments to be run
+    runs_ft = 30
+    epochs_base_model = 20  # Max number of epochs with the base network frozen (for transfer learning)
+    epochs_ft = 30  # Max number of epochs for fine-tuning
     ''' Set to true to display all the (augmented or not) training samples in a grid, one line per batch. Samples
     are shown the way they would be just before being fed to the model. Should be used in conjunction with 
     limit_samples'''
@@ -369,34 +369,41 @@ def main():
     plt.pause(.01)
 
     # Instantiate the base model (pre-trained) for transfer learning
-    # For additional regularization, try setting drop_connect_rate here below
-    inputs = tf.keras.layers.Input(shape=input_res + (3,))
-    pre_trained = model_choice(input_tensor=inputs,
-                               input_shape=input_res + (3,),
-                               weights='imagenet',
-                               include_top=False,
-                               pooling='avg')
 
-    # Freeze the weights in the base model, to use it for transfer learning
-    pre_trained.trainable = False
+    def make_pre_trained_model(pre_trained_model, dataset_mean, dataset_var):
+        # For additional regularization, try setting drop_connect_rate here below
+        inputs = tf.keras.layers.Input(shape=input_res + (3,))
+        pre_trained = model_choice(input_tensor=inputs,
+                                   input_shape=input_res + (3,),
+                                   weights='imagenet',
+                                   include_top=False,
+                                   pooling='avg')
 
-    # Append a final classification layer at the end of the base model (this will be trainable)
-    x = pre_trained(inputs)
-    x = Dense(1280 // 2, activation='sigmoid', name='dense_1')(x)
-    # x = tf.keras.layers.BatchNormalization()(x)
-    y_train_freq = metadata_train[variable_labels].sum(axis=0) / len(metadata_train)
-    if min(y_train_freq) == 0:
-        print(
-            'Some of the variables are never set to 1 in the training dataset. Increase the number of training samples.')
-        print(y_train_freq)
-        exit(-1)
-    bias_init = np.log(y_train_freq / (1 - y_train_freq)).to_numpy()
-    outputs = Dense(n_classes, activation='sigmoid', bias_initializer=tf.keras.initializers.Constant(bias_init),
-                    name='dense_final')(x)
+        pre_trained.layers[2].mean.assign(dataset_mean)
+        pre_trained.layers[2].variance.assign(dataset_var)
 
-    model = Model(inputs=inputs, outputs=outputs)
+        # Freeze the weights in the base model, to use it for transfer learning
+        pre_trained.trainable = False
 
-    print()
+        # Append a final classification layer at the end of the base model (this will be trainable)
+        x = pre_trained(inputs)
+        x = Dense(1280 // 2, activation='sigmoid', name='dense_1')(x)
+        # x = tf.keras.layers.BatchNormalization()(x)
+        y_train_freq = metadata_train[variable_labels].sum(axis=0) / len(metadata_train)
+        if min(y_train_freq) == 0:
+            print(
+                'Some of the variables are never set to 1 in the training dataset. Increase the number of training samples.')
+            print(y_train_freq)
+            exit(-1)
+        bias_init = np.log(y_train_freq / (1 - y_train_freq)).to_numpy()
+        outputs = Dense(n_classes, activation='sigmoid', bias_initializer=tf.keras.initializers.Constant(bias_init),
+                        name='dense_final')(x)
+
+        model = Model(inputs=inputs, outputs=outputs)
+
+        return model, pre_trained
+
+    """print()
     model.summary()
     if print_base_model_summary:
         pre_trained.summary()
@@ -410,7 +417,7 @@ def main():
                 count += 1
         print(f'{count} out of {len(model.layers)} layers are trainable')
 
-    print_trainable_layers(model)
+    print_trainable_layers(model)"""
 
     ''' Calculate mean and variance of each image channel across the training set, and set them in the normalization
     layer of the pre-trained model '''
@@ -446,9 +453,7 @@ def main():
 
     print(f'Computed mean {mean_by_pixel.numpy()} and variance {var_by_pixel.numpy()} for the training dataset.')
     mean_by_pixel = tf.concat([mean_by_pixel] * 3, axis=0)
-    pre_trained.layers[2].mean.assign(mean_by_pixel)
     var_by_pixel = tf.concat([var_by_pixel] * 3, axis=0)
-    pre_trained.layers[2].variance.assign(var_by_pixel)
 
     def display_by_batch(dataset):
         batch_iter = iter(dataset)
@@ -495,7 +500,7 @@ def main():
                     (self.optimization_direction == 'min' and metric_value < self.best_so_far):
                 self.best_so_far = metric_value
                 self.best_epoch = self.epoch
-                new_model_file_name = models_root + '/'+str_time +'/' +self.file_name_stem + f'-{self.epoch}.h5'
+                new_model_file_name = models_root + '/' + str_time + '/' + self.file_name_stem + f'-{self.epoch}.h5'
                 print(
                     f'Best epoch so far {self.best_epoch} with {self.optimization_direction} {self.metric_key} = {self.best_so_far} -Saving model in file {new_model_file_name}')
                 self.model.save(new_model_file_name)
@@ -513,23 +518,33 @@ def main():
                      tf.keras.metrics.AUC(multi_label=True, name='auc')])
         return model
 
-    def run_exp(params):  # TODO parameters that are not hyper: closure or pass them?
-        model, train_batch_size, epochs, learning_rate, file_name_stem, trials, metadata_train, metadata_val = [
+    def run_exp(params):
+        base_model_file_name, metadata_mean, metadata_var, train_batch_size, epochs, learning_rate, file_name_stem, \
+        trials, metadata_train, metadata_val = [
             params[key] for key in
-            ('model',
-             'train_batch_size',
-             'epochs',
-             'learning_rate',
-             'file_name_stem',
-             'trials',
-             'metadata_train',
-             'metadata_val')]
+            ('base_model_file_name', 'metadata_mean', 'metadata_var', 'train_batch_size', 'epochs',
+             'learning_rate', 'file_name_stem', 'trials', 'metadata_train', 'metadata_val')]
 
         trial_idx = len(trials.trials) - 1 if trials is not None else 0
-        print(f'\nRunning experiment {trial_idx + 1}/{runs} with parameters:')
+        print(f'\nRunning experiment {trial_idx + 1} with parameters:')
         for key, value in params.items():
             if key not in ('trials', 'metadata_train', 'metadata_val'):
                 print(f'{key} = {value}')
+
+        if base_model_file_name is None:
+            model, _ = make_pre_trained_model(pre_trained_model=model_choice,
+                                              dataset_mean=metadata_mean,
+                                              dataset_var=metadata_var)
+        else:
+            print(
+                f'Reloading best model from file {base_model_fname} obtained during experiment {best_trial_idx + 1}/{runs}')
+            model = tf.keras.models.load_model(base_model_file_name)
+            ''' Ensure all layers are trainable, as model may have been saved with frozen weights after first training
+            and before fine-tuning '''
+            for layer in model.layers:
+                layer.trainable = True
+
+        model = compile_model(model, learning_rate=learning_rate)
 
         dataset_train = make_pipeline(file_names=metadata_train['image_id'],
                                       y=metadata_train[variable_labels],
@@ -543,19 +558,17 @@ def main():
                                     weights=None,
                                     batch_size=val_batch_size,
                                     shuffle=False,
-                                    for_model=True) if metadata_val is not None else None
-        model = compile_model(model, learning_rate=learning_rate)
+                                    for_model=True) \
+            if metadata_val is not None else None
 
         log_dir = logs_root + '/' + str_time + '/{}-{:03d}'.format(file_name_stem, trial_idx)
         print(f'\nLogging training and validation to directory {log_dir}')
         tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir=log_dir,
                                                         histogram_freq=1,
                                                         profile_batch=(1, 8))
-
         checkpoint_cb = CheckpointBestModel(file_name_stem=file_name_stem + f'-{trial_idx}',
                                             metric_key='val_auc',
                                             optimization_direction='max')
-
         early_stopping_cb = tf.keras.callbacks.EarlyStopping(monitor='val_loss',
                                                              patience=100,
                                                              verbose=1,
@@ -581,18 +594,26 @@ def main():
             assert (history.epoch[best_epoch] == best_epoch)
             best_epoch_metric = history.history['val_auc'][best_epoch]
 
+        if metadata_val is None:
+            new_model_file_name = models_root + '/' + str_time + '/' + file_name_stem + '.h5'
+            print(f'\nSaving optimized model in {new_model_file_name}')
+            model.save(new_model_file_name)
+        else:
+            new_model_file_name = checkpoint_cb.model_file_name
         # Hyperopt will minimize the return value below
         res = {'status': STATUS_OK,
                'loss': -best_epoch_metric,
                'history': history,
-               'model_file_name': checkpoint_cb.model_file_name}
+               'model_file_name': new_model_file_name}
         return res
 
     trials = Trials()
 
     params_space = {
+        'base_model_file_name': None,
+        'metadata_mean': mean_by_pixel,
+        'metadata_var': var_by_pixel,
         'learning_rate': hp.loguniform('learning_rate', np.log(1e-4), np.log(1e-3)),
-        'model': model,
         'train_batch_size': hp.choice('train_batch_size', train_batch_sizes),
         'epochs': epochs_base_model,
         'file_name_stem': 'base_model',
@@ -610,21 +631,15 @@ def main():
 
     best_trial_idx = np.argmin([result['loss'] for result in trials.results])
     base_model_fname = trials.best_trial['result']['model_file_name']
-    print(
-        f'Reloading best model from file {base_model_fname} obtained during experiment {best_trial_idx + 1}/{runs}')
-    model = tf.keras.models.load_model(base_model_fname)
-    # run_exp(model, epochs=epochs_base_model, learning_rate=1.5e-4, file_name_stem='base_model')
     print('\nFine-tuning and validating model.')
-
-    # Un-freeze the weights of the base model to fine tune. Also see https://bit.ly/2YnJwqg
-    pre_trained.trainable = True
-    print_trainable_layers(model)
 
     trials_ft = Trials()
 
     params_space_ft = {
+        'base_model_file_name': base_model_fname,
+        'metadata_mean': mean_by_pixel,
+        'metadata_var': var_by_pixel,
         'learning_rate': hp.loguniform('learning_rate', np.log(1e-4), np.log(1e-3)),
-        'model': model,
         'train_batch_size': hp.choice('train_batch_size', train_batch_sizes),
         'epochs': epochs_ft,
         'file_name_stem': 'fine_tuned_model',
@@ -643,14 +658,16 @@ def main():
     best_trial_idx_ft = np.argmin([result['loss'] for result in trials_ft.results])
     ft_model_fname = trials_ft.best_trial['result']['model_file_name']
     print(
-        f'\nReloading best fine-tuned model from file {ft_model_fname} obtained during experiment {best_trial_idx_ft + 1}/{runs_ft}')
-    model = tf.keras.models.load_model(ft_model_fname)
+        f'\nBest best fine-tuned model is in file {ft_model_fname}, result of experiment {best_trial_idx_ft + 1}/{runs_ft}')
     print('Retraining it on the whole trainig+validation dataset, for testing and inference.')
     metadata_dev = metadata_train.append(metadata_val)
     metadata_dev['weights'] = compute_sample_weights(metadata_dev, variable_labels)
+    metadata_dev = metadata_dev.sample(frac=1, random_state=seed)
 
-    params_space_dev = {'learning_rate': best_ft['learning_rate'],
-                        'model': model,
+    params_space_dev = {'base_model_file_name': ft_model_fname,
+                        'metadata_mean': mean_by_pixel,
+                        'metadata_var': var_by_pixel,
+                        'learning_rate': best_ft['learning_rate'],
                         'train_batch_size': train_batch_sizes[best_ft['train_batch_size']],
                         'epochs': np.argmax(trials_ft.best_trial['result']['history'].history['val_auc']) + 1,
                         'file_name_stem': 'final_model',
@@ -669,17 +686,17 @@ def main():
                                  shuffle=False,
                                  for_model=True)
 
-    # log_dir = 'logs/' + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     log_dir = logs_root + '/' + str_time + '/final_model_test'
-    print(f'\nLogging training to directory {log_dir}')
+    print(f"\nTesting final model saved in {res['model_file_name']}. Logging to directory {log_dir}")
     tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir=log_dir,
                                                     histogram_freq=1,
                                                     profile_batch=0)
 
-    test_result = model.evaluate(dataset_eval,
-                                 callbacks=[tensorboard_cb],
-                                 return_dict=True,
-                                 verbose=1)
+    final_model = tf.keras.models.load_model(res['model_file_name'])
+    test_result = final_model.evaluate(dataset_eval,
+                                       callbacks=[tensorboard_cb],
+                                       return_dict=True,
+                                       verbose=1)
     print(test_result)
 
 
@@ -687,11 +704,13 @@ if __name__ == '__main__':
     main()
 
 ''' TODO:
-Ensure every experiment starts from the pre-trained weights or the traiend base model
-Verify proper metrics for multi-label problems
-Make the pipelines deterministic, check if any performance hit
+Save report in csv format
+Verify that setting all weights to 1 is the same as no weights, also loss-wise
+Do k-fold x-validation on the final model
 Try a decaying learning rate (learning rate annealing)
 Resuming an interrupted computation
+Verify proper metrics for multi-label problems
+Make the pipelines deterministic, check if any performance hit
 Convert images from grayscale to RGB in batches
 Try detection
 Try another NN (e.g. DenseNet) and also train it from scratch (no transfer learning)  
