@@ -144,14 +144,14 @@ class CheckpointEpoch(tf.keras.callbacks.Callback):
         self.patience = patience
         self.best_so_far = best_so_far if best_so_far is not None else float(
             'inf') if optimization_direction == 'min' else float('-inf')
-        self.epochs_total = already_computed_epochs  # Epochs are numbered starting from 1
+        # self.epochs_total = already_computed_epochs  # Epochs are numbered starting from 1
         self.best_epoch = best_epoch
         self.model_file_name = None
         self.file_name_stem = file_name_stem
         self.max_epochs = max_epochs
 
     def on_epoch_end(self, epoch, logs=None):
-        self.epochs_total += 1
+        # self.epochs_total += 1
         # Save the model at the end of the epoch, to be able to resume training from there
         tf.keras.models.save_model(model=self.model,
                                    filepath=self.file_name_stem + '.h5.tmp',
@@ -164,16 +164,16 @@ class CheckpointEpoch(tf.keras.callbacks.Callback):
         if (self.optimization_direction == 'max' and metric_value > self.best_so_far) or \
                 (self.optimization_direction == 'min' and metric_value < self.best_so_far):
             self.best_so_far = metric_value
-            self.best_epoch = self.epochs_total
+            self.best_epoch = epoch
             new_model_file_name = self.file_name_stem + '_best.h5'
             print(
                 f'Best epoch so far {self.best_epoch} with {self.optimization_direction} {self.metric_key} = {self.best_so_far} -Saving model in file {new_model_file_name}')
             shutil.copyfile(self.file_name_stem + '.h5', self.file_name_stem + '_best.h5')
 
-        if self.epochs_total >= self.max_epochs:
+        if epoch + 1 >= self.max_epochs:  # epochs are numbered from 0
             print(f'\nStopping training as it has reached the maximum number of epochs {self.max_epochs}')
             self.model.stop_training = True
-        elif self.patience is not None and self.epochs_total - self.best_epoch > self.patience:
+        elif self.patience is not None and epoch - self.best_epoch > self.patience:
             if self.patience == 0:
                 print('\nStopping training has there has been no improvement since the previous epoch.')
             else:
@@ -181,7 +181,7 @@ class CheckpointEpoch(tf.keras.callbacks.Callback):
             self.model.stop_training = True
 
         # Save those variables, needed to resume training from the last epoch, that are not saved with the model
-        pickle_this = {'epochs_total': self.epochs_total,
+        pickle_this = {'epochs_total': epoch + 1,  # Epochs are numbered from 0
                        'best_so_far': self.best_so_far,
                        'best_epoch': self.best_epoch}
         pickle_fname = self.file_name_stem + '.pickle'
@@ -190,7 +190,27 @@ class CheckpointEpoch(tf.keras.callbacks.Callback):
         keep_last_two_files(pickle_fname)
 
 
-def checkpointed_fit(model, checkpoint_fname_stem, metric_key, optimization_direction, patience, max_epochs, **args):
+class LearningRateScheduler():
+    def __init__(self, alpha, decay, k):
+        self.alpha = alpha
+        self.decay = decay
+        self.k = k
+    def update(self, epoch, lr):
+        print(f'Learning rate was {lr} at epoch {epoch}')
+        updated_lr = self.alpha*(self.decay**(epoch/self.k))
+        print(f'Now it is {updated_lr}')
+        return updated_lr
+
+def checkpointed_fit(model,
+                     checkpoint_fname_stem,
+                     metric_key,
+                     optimization_direction,
+                     patience,
+                     max_epochs,
+                     alpha,
+                     decay,
+                     k,
+                     **args):
     # These variables will be overwritten if a saved model and pickle file exist
     already_computed_epochs = 0
     best_so_far = None
@@ -209,7 +229,8 @@ def checkpointed_fit(model, checkpoint_fname_stem, metric_key, optimization_dire
             print(f'\nThe model has already been trained for the maximum number of epochs {max_epochs}.')
             return None
         if already_computed_epochs - best_epoch > patience:
-            print(f'\nModel training already stopped after {already_computed_epochs} epoch(s) because it exceeded {patience} epoch(s) without improvement on metric {metric_key}.')
+            print(
+                f'\nModel training already stopped after {already_computed_epochs} epoch(s) because it exceeded {patience} epoch(s) without improvement on metric {metric_key}.')
             return None
 
         print(
@@ -223,10 +244,14 @@ def checkpointed_fit(model, checkpoint_fname_stem, metric_key, optimization_dire
                                           max_epochs=max_epochs,
                                           best_so_far=best_so_far,
                                           best_epoch=best_epoch)
+
+
+    scheduler = LearningRateScheduler(alpha=alpha, decay=decay, k=k)
+    learning_rate_scheduler_cb = tf.keras.callbacks.LearningRateScheduler(scheduler.update, verbose=1)
     callbacks = args.get('callbacks', [])
-    callbacks += [checkpoint_epoch_cb]
+    callbacks += [checkpoint_epoch_cb, learning_rate_scheduler_cb]
     args['callbacks'] = callbacks
-    history = model.fit(**args)
+    history = model.fit(initial_epoch=already_computed_epochs, **args)
     return history
 
 
@@ -235,7 +260,10 @@ checkpointed_fit(model=model,
                  metric_key='val_sparse_categorical_accuracy',
                  optimization_direction='max',
                  patience=100,
-                 max_epochs=40,
+                 max_epochs=24,
+                 alpha = .001,
+                 decay=.97,
+                 k = 2.4,
                  x=ds_train,
-                 epochs=40,
+                 epochs=24,
                  validation_data=ds_test)
