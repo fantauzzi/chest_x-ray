@@ -121,7 +121,7 @@ model.compile(
 
 
 checkpointed_fit(model=model,
-                 checkpoint_fname_stem='./epoch_checkpoint',
+                 path_and_fname_stem='./epoch_checkpoint',
                  metric_key='val_sparse_categorical_accuracy',
                  optimization_direction='max',
                  patience=100,

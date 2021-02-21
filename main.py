@@ -6,56 +6,247 @@ import tensorflow as tf
 from tensorflow.keras.layers import Dense
 from tensorflow.keras.models import Model
 from pathlib import Path
-from math import ceil
 import pickle
 import random
 from tqdm import tqdm
-from shutil import rmtree
-
 from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
+from keras_utils import checkpointed_fit
+import shutil
+
+seed = 42
+random.seed(seed)
+
+comp_label = 'small'
+
+comp_state_root = './computation_states'
+comp_state_dir = comp_state_root + '/' + comp_label
+models_root_dir = './models'
+models_dir = models_root_dir + '/' + comp_label
+dataset_root = '/mnt/storage/datasets/vinbigdata'
+train_dir = dataset_root + '/train'
+aug_dir = dataset_root + '/aug-train'  # Where generated augmented images will be stored
+logs_root = './logs'  # Logs for Tensorboard will be organized in subdirs. within this dir.
+metadata_pickle_fname = dataset_root + '/metadata.pickle'
+base_trials_fname = comp_state_dir + '/base_model_trials.pickle'
+ft_trials_fname = comp_state_dir + '/fine_tuned_model_trials.pickle'
+
+''' For input resolution, check here, based on the choice of EfficientNet:
+ https://keras.io/examples/vision/image_classification_efficientnet_fine_tuning/ '''
+input_res = (224, 224)
+n_classes = 1  # Samples will be classified among the n_classes most frequent classes in the dataset
+assert n_classes <= 14
+# Can use the whole dataset, setting limit_samples to None, or a subset of it, of size limit_samples.
+limit_samples = 200
+# List of batch sizes for training to choose from during hyper-parameters tuning
+train_batch_sizes = [8, 16, 24, 32, 48, 64]
+val_batch_size = 64  # Batch size used for validation and also test
+''' Number of experiments to be run for tuning of hyper-parameters of the base model and of fine tuning 
+respectively'''
+n_trials_base = 3  # Number of experiments to be run
+n_trials_ft = 3
+epochs_base_model = 5  # Max number of epochs with the base network frozen (for transfer learning)
+epochs_ft = 5  # Max number of epochs for fine-tuning
+''' Set to true to display all the (augmented or not) training samples in a grid, one line per batch. Samples
+are shown the way they would be just before being fed to the model. Should be used in conjunction with 
+limit_samples'''
+vis_batches = False
+print_base_model_summary = False
+p_test = .15  # Proportion of the dataset to be held out for test (test set)
+model_choice = tf.keras.applications.EfficientNetB0
+
+
+def get_preprocessed_file_names(file_names):
+    res = file_names.apply(
+        lambda file_name: aug_dir + '/' + Path(file_name).stem + '_00.png')
+    return res
+
+
+def load_sample(file_name, *params):
+    # TODO consider returning the image in the range [0,1] already, and change the way it is fed to the model
+    image = tf.io.read_file(file_name)
+    image = tf.io.decode_jpeg(image)
+
+    # Perform all transformations on the image in the domain of floating point numbers [.0, 1.] , for improved accuracy
+    image = tf.cast(image, tf.float32)
+
+    # Maximise the image dynamic range, scaling the image values to the full interval [0-255]
+    the_min = tf.reduce_min(image)
+    the_max = tf.reduce_max(image)
+    image = (image - the_min) / (the_max - the_min) * 255
+
+    return (image, file_name) + params
+
+
+def augment_image(image, file_name, aug_file_name, y, augment_params):
+    side = float(tf.shape(image)[0])
+    image_np = image.numpy()
+    fill_mode = 'constant'
+    cval = 0
+    order = 1
+    [zoom_x, zoom_y, shear, translate_x, translate_y] = augment_params
+    image_np = tf.keras.preprocessing.image.apply_affine_transform(image_np,
+                                                                   zx=zoom_x,
+                                                                   zy=zoom_y,
+                                                                   order=order,
+                                                                   fill_mode=fill_mode,
+                                                                   cval=cval)
+    image_np = tf.keras.preprocessing.image.apply_affine_transform(image_np,
+                                                                   shear=shear,
+                                                                   order=order,
+                                                                   fill_mode=fill_mode,
+                                                                   cval=cval)
+    image_np = tf.keras.preprocessing.image.apply_affine_transform(image_np,
+                                                                   tx=translate_x * side,
+                                                                   ty=translate_y * side,
+                                                                   order=order,
+                                                                   fill_mode=fill_mode,
+                                                                   cval=cval)
+    image = tf.convert_to_tensor(image_np)
+
+    return image, file_name, aug_file_name, y, augment_params
+
+
+def finalize_and_save_sample(image, file_name, aug_file_name, y=None, augment_params=None):
+    # Make the image square, padding with 0s as necessary
+    image_shape = tf.shape(image)
+    target_side = tf.math.maximum(image_shape[0], image_shape[1])
+    image = tf.image.resize_with_crop_or_pad(image, target_height=target_side, target_width=target_side)
+
+    # Re-sample the image to the expected input size and type for the model
+    image = tf.image.resize(image, size=input_res, method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
+    image = tf.math.round(image)
+    image = tf.cast(image, tf.uint8)
+    image_encoded = tf.io.encode_png(image, compression=-1)
+    tf.io.write_file(aug_file_name, image_encoded)
+
+    return aug_file_name
+
+
+def make_aug_pipeline(file_names, y, augment_params, aug_file_names):
+    dataset = tf.data.Dataset.from_tensor_slices((file_names, aug_file_names, y, augment_params))
+    dataset = dataset.map(load_sample, num_parallel_calls=tf.data.AUTOTUNE)
+    dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+    dataset = dataset.map(
+        lambda *params: tf.py_function(func=augment_image,
+                                       inp=params,
+                                       Tout=[tf.float32, tf.string, tf.string, tf.int64, tf.float64]
+                                       ),
+        num_parallel_calls=tf.data.AUTOTUNE)
+    dataset = dataset.map(finalize_and_save_sample, num_parallel_calls=tf.data.AUTOTUNE)
+    dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+
+    return dataset
+
+
+def make_pre_process_pipeline(file_names, preprocess_file_names):
+    dataset = tf.data.Dataset.from_tensor_slices((file_names, preprocess_file_names))
+    dataset = dataset.map(load_sample, num_parallel_calls=tf.data.AUTOTUNE)
+    dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+    dataset = dataset.map(finalize_and_save_sample, num_parallel_calls=tf.data.AUTOTUNE)
+    dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+
+    return dataset
+
+
+def compute_sample_weights(metadata, variable_labels):
+    """ Compute training sample weights, and add them as a new column to the dataframe. The sequence of labels (1 and 0)
+    for each sample are interpreted as a binary number, which becomes a "class" for the given sample, for the
+    purpose of calculating the sample weight. If the obtained "class" appears in the training dataset p times, and the
+    dataset contains N samples overall, then the weight for the given samples is set to (N-p)/N.
+    TODO: could samples with very rare "class" get a weight so high to screw the gradient of the loss? """
+
+    def convert_to_int_class(row):
+        int_value = 0
+        for i, item in enumerate(row):
+            pos = len(row) - i - 1
+            int_value += item * (2 ** pos)
+        return int_value
+
+    int_class = metadata[variable_labels].apply(convert_to_int_class, axis=1)
+    int_class_counts = int_class.value_counts()
+    metadata_count = int_class.apply(lambda item: int_class_counts[item])
+    metadata['weights'] = (sum(int_class_counts) - metadata_count) / sum(int_class_counts)
+
+    print(f'\nFound {len(int_class_counts)} class combinations while assigning weights to training samples.')
+    print(f'Most occurring class combination in training dataset appears {int_class_counts.max()} times.')
+    print(f'Least occurring class combination in training dataset appears {int_class_counts.min()} time(s).')
+    return metadata['weights']
+
+
+def load_image(file_name, *params):
+    # TODO consider returning the image in the range [0,1] already, and change the way it is fed to the model
+    image = tf.io.read_file(file_name)
+    image = tf.io.decode_png(image)
+    image = tf.image.grayscale_to_rgb(image)
+    return (image, file_name) + params
+
+
+def make_pipeline(file_names, y, weights, batch_size, shuffle, for_model):
+    if weights is None:
+        weights = pd.Series([1.] * len(file_names))
+
+    dataset = tf.data.Dataset.from_tensor_slices((file_names, y, weights))
+    dataset = dataset.cache()
+    if shuffle:
+        dataset = dataset.shuffle(buffer_size=len(y), seed=42, reshuffle_each_iteration=True)
+    dataset = dataset.map(load_image, num_parallel_calls=tf.data.AUTOTUNE)
+    ''' If the dataset is meant to be fed to a model (for training or inference) then strip the information on the 
+    file name '''
+    if for_model:
+        dataset = dataset.map(lambda *sample: (sample[0], sample[2], sample[3]),
+                              num_parallel_calls=tf.data.AUTOTUNE)
+    dataset = dataset.batch(batch_size=batch_size, drop_remainder=False)
+    dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+
+    return dataset
+
+
+def load_grayscale_image(file_name, *params):
+    image = tf.io.read_file(file_name)
+    image = tf.io.decode_png(image)
+    image = tf.cast(image, dtype=tf.float32)
+    image = image / 255.
+    return (image,) + params
+
+    # Instantiate the base model (pre-trained) for transfer learning
+
+
+def make_pre_trained_model(pre_trained_model, dataset_mean, dataset_var, bias_init):
+    # For additional regularization, try setting drop_connect_rate here below
+    inputs = tf.keras.layers.Input(shape=input_res + (3,))
+    pre_trained = pre_trained_model(input_tensor=inputs,
+                                    input_shape=input_res + (3,),
+                                    weights='imagenet',
+                                    include_top=False,
+                                    pooling='avg')
+
+    pre_trained.layers[2].mean.assign(dataset_mean)
+    pre_trained.layers[2].variance.assign(dataset_var)
+
+    # Freeze the weights in the base model, to use it for transfer learning
+    pre_trained.trainable = False
+
+    # Append a final classification layer at the end of the base model (this will be trainable)
+    x = pre_trained(inputs)
+    x = Dense(1280 // 2, activation='sigmoid', name='dense_1')(x)
+    # x = tf.keras.layers.BatchNormalization()(x)
+    """y_train_freq = metadata_train[variable_labels].sum(axis=0) / len(metadata_train)
+    if min(y_train_freq) == 0:
+        print(
+            'Some of the variables are never set to 1 in the training dataset. Increase the number of training samples.')
+        print(y_train_freq)
+        exit(-1)
+    bias_init = np.log(y_train_freq / (1 - y_train_freq)).to_numpy()"""
+    outputs = Dense(n_classes, activation='sigmoid', bias_initializer=tf.keras.initializers.Constant(bias_init),
+                    name='dense_final')(x)
+
+    model = Model(inputs=inputs, outputs=outputs)
+
+    return model, pre_trained
 
 
 def main():
     # str_time = datetime.datetime.now().strftime("%m%d-%H%M%S")
-    seed = 42
-    random.seed(seed)
-
-    comp_label = 'small'
-
-    comp_state_root = './computation_states'
-    comp_state_dir = comp_state_root + '/' + comp_label
-    models_dir = './models'
-    dataset_root = '/mnt/storage/datasets/vinbigdata'
-    train_dir = dataset_root + '/train'
-    aug_dir = dataset_root + '/aug-train'  # Where generated augmented images will be stored
-    logs_root = './logs'  # Logs for Tensorboard will be organized in subdirs. within this dir.
-    metadata_pickle_fname = dataset_root + '/metadata.pickle'
-    base_trials_fname = comp_state_dir + '/base_model_trials.pickle'
-    ft_trials_fname = comp_state_dir + '/fine_tuned_model_trials.pickle'
-
-    ''' For input resolution, check here, based on the choice of EfficientNet:
-     https://keras.io/examples/vision/image_classification_efficientnet_fine_tuning/ '''
-    input_res = (224, 224)
-    n_classes = 1  # Samples will be classified among the n_classes most frequent classes in the dataset
-    assert n_classes <= 14
-    # Can use the whole dataset, setting limit_samples to None, or a subset of it, of size limit_samples.
-    limit_samples = 200
-    # List of batch sizes for training to choose from during hyper-parameters tuning
-    train_batch_sizes = [8, 16, 24, 32, 48, 64]
-    val_batch_size = 64  # Batch size used for validation and also test
-    ''' Number of experiments to be run for tuning of hyper-parameters of the base model and of fine tuning 
-    respectively'''
-    n_trials_base = 3  # Number of experiments to be run
-    n_trials_ft = 3
-    epochs_base_model = 5  # Max number of epochs with the base network frozen (for transfer learning)
-    epochs_ft = 10  # Max number of epochs for fine-tuning
-    ''' Set to true to display all the (augmented or not) training samples in a grid, one line per batch. Samples
-    are shown the way they would be just before being fed to the model. Should be used in conjunction with 
-    limit_samples'''
-    vis_batches = False
-    print_base_model_summary = False
-    p_test = .15  # Proportion of the dataset to be held out for test (test set)
-    model_choice = tf.keras.applications.EfficientNetB0
 
     aug_param_labels = ['zoom_x', 'zoom_y', 'shear', 'translate_x', 'translate_y']
 
@@ -150,7 +341,7 @@ def main():
     if not device_name:
         print('GPU not found')
     else:
-        print('Found GPU at: f{device_name}')
+        print(f'Found GPU at: {device_name}')
 
     def make_augmented_metadata(sample):
         max_zoom = .15
@@ -167,93 +358,6 @@ def main():
         stem; augmented images go to their own directory. '''
         augmented['aug_image_id'] = aug_dir + '/' + Path(sample['image_id']).stem + '_01.png'
         return augmented
-
-    def load_sample(file_name, *params):
-        # TODO consider returning the image in the range [0,1] already, and change the way it is fed to the model
-        image = tf.io.read_file(file_name)
-        image = tf.io.decode_jpeg(image)
-
-        # Perform all transformations on the image in the domain of floating point numbers [.0, 1.] , for improved accuracy
-        image = tf.cast(image, tf.float32)
-
-        # Maximise the image dynamic range, scaling the image values to the full interval [0-255]
-        the_min = tf.reduce_min(image)
-        the_max = tf.reduce_max(image)
-        image = (image - the_min) / (the_max - the_min) * 255
-
-        return (image, file_name) + params
-
-    def augment_image(image, file_name, aug_file_name, y, augment_params):
-        side = float(tf.shape(image)[0])
-        image_np = image.numpy()
-        fill_mode = 'constant'
-        cval = 0
-        order = 1
-        [zoom_x, zoom_y, shear, translate_x, translate_y] = augment_params
-        image_np = tf.keras.preprocessing.image.apply_affine_transform(image_np,
-                                                                       zx=zoom_x,
-                                                                       zy=zoom_y,
-                                                                       order=order,
-                                                                       fill_mode=fill_mode,
-                                                                       cval=cval)
-        image_np = tf.keras.preprocessing.image.apply_affine_transform(image_np,
-                                                                       shear=shear,
-                                                                       order=order,
-                                                                       fill_mode=fill_mode,
-                                                                       cval=cval)
-        image_np = tf.keras.preprocessing.image.apply_affine_transform(image_np,
-                                                                       tx=translate_x * side,
-                                                                       ty=translate_y * side,
-                                                                       order=order,
-                                                                       fill_mode=fill_mode,
-                                                                       cval=cval)
-        image = tf.convert_to_tensor(image_np)
-
-        return image, file_name, aug_file_name, y, augment_params
-
-    def finalize_and_save_sample(image, file_name, aug_file_name, y=None, augment_params=None):
-        # Make the image square, padding with 0s as necessary
-        image_shape = tf.shape(image)
-        target_side = tf.math.maximum(image_shape[0], image_shape[1])
-        image = tf.image.resize_with_crop_or_pad(image, target_height=target_side, target_width=target_side)
-
-        # Re-sample the image to the expected input size and type for the model
-        image = tf.image.resize(image, size=input_res, method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
-        image = tf.math.round(image)
-        image = tf.cast(image, tf.uint8)
-        image_encoded = tf.io.encode_png(image, compression=-1)
-        tf.io.write_file(aug_file_name, image_encoded)
-
-        return aug_file_name
-
-    def make_aug_pipeline(file_names, y, augment_params, aug_file_names):
-        dataset = tf.data.Dataset.from_tensor_slices((file_names, aug_file_names, y, augment_params))
-        dataset = dataset.map(load_sample, num_parallel_calls=tf.data.AUTOTUNE)
-        dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
-        dataset = dataset.map(
-            lambda *params: tf.py_function(func=augment_image,
-                                           inp=params,
-                                           Tout=[tf.float32, tf.string, tf.string, tf.int64, tf.float64]
-                                           ),
-            num_parallel_calls=tf.data.AUTOTUNE)
-        dataset = dataset.map(finalize_and_save_sample, num_parallel_calls=tf.data.AUTOTUNE)
-        dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
-
-        return dataset
-
-    def make_pre_process_pipeline(file_names, preprocess_file_names):
-        dataset = tf.data.Dataset.from_tensor_slices((file_names, preprocess_file_names))
-        dataset = dataset.map(load_sample, num_parallel_calls=tf.data.AUTOTUNE)
-        dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
-        dataset = dataset.map(finalize_and_save_sample, num_parallel_calls=tf.data.AUTOTUNE)
-        dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
-
-        return dataset
-
-    def get_preprocessed_file_names(file_names):
-        res = file_names.apply(
-            lambda file_name: aug_dir + '/' + Path(file_name).stem + '_00.png')
-        return res
 
     if Path(metadata_pickle_fname).is_file():
         print(f'\nLoading metadata for pre-processed and augmented detaset from file {metadata_pickle_fname}')
@@ -297,57 +401,9 @@ def main():
     print(f'Validation set contains {len(metadata_val)} samples.')
     print(f'Test set contains {len(metadata_test)} samples.')
 
-    def compute_sample_weights(metadata, variable_labels):
-        """ Compute training sample weights, and add them as a new column to the dataframe. The sequence of labels (1 and 0)
-        for each sample are interpreted as a binary number, which becomes a "class" for the given sample, for the
-        purpose of calculating the sample weight. If the obtained "class" appears in the training dataset p times, and the
-        dataset contains N samples overall, then the weight for the given samples is set to (N-p)/N.
-        TODO: could samples with very rare "class" get a weight so high to screw the gradient of the loss? """
-
-        def convert_to_int_class(row):
-            int_value = 0
-            for i, item in enumerate(row):
-                pos = len(row) - i - 1
-                int_value += item * (2 ** pos)
-            return int_value
-
-        int_class = metadata[variable_labels].apply(convert_to_int_class, axis=1)
-        int_class_counts = int_class.value_counts()
-        metadata_count = int_class.apply(lambda item: int_class_counts[item])
-        metadata['weights'] = (sum(int_class_counts) - metadata_count) / sum(int_class_counts)
-
-        print(f'\nFound {len(int_class_counts)} class combinations while assigning weights to training samples.')
-        print(f'Most occurring class combination in training dataset appears {int_class_counts.max()} times.')
-        print(f'Least occurring class combination in training dataset appears {int_class_counts.min()} time(s).')
-        return metadata['weights']
-
-    def load_image(file_name, *params):
-        # TODO consider returning the image in the range [0,1] already, and change the way it is fed to the model
-        image = tf.io.read_file(file_name)
-        image = tf.io.decode_png(image)
-        image = tf.image.grayscale_to_rgb(image)
-        return (image, file_name) + params
-
-    def make_pipeline(file_names, y, weights, batch_size, shuffle, for_model):
-        if weights is None:
-            weights = pd.Series([1.] * len(file_names))
-
-        dataset = tf.data.Dataset.from_tensor_slices((file_names, y, weights))
-        dataset = dataset.cache()
-        if shuffle:
-            dataset = dataset.shuffle(buffer_size=len(y), seed=42, reshuffle_each_iteration=True)
-        dataset = dataset.map(load_image, num_parallel_calls=tf.data.AUTOTUNE)
-        ''' If the dataset is meant to be fed to a model (for training or inference) then strip the information on the 
-        file name '''
-        if for_model:
-            dataset = dataset.map(lambda *sample: (sample[0], sample[2], sample[3]),
-                                  num_parallel_calls=tf.data.AUTOTUNE)
-        dataset = dataset.batch(batch_size=batch_size, drop_remainder=False)
-        dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
-
-        return dataset
-
     metadata_train['weights'] = compute_sample_weights(metadata_train, variable_labels)
+
+    """
     # Show a couple images from a pipeline, along with their GT, as a sanity check
     n_cols = 4
     n_rows = ceil(16 / n_cols)
@@ -377,41 +433,7 @@ def main():
             axs[row, col].set_ylabel(y_label)
     plt.draw()
     plt.pause(.01)
-
-    # Instantiate the base model (pre-trained) for transfer learning
-
-    def make_pre_trained_model(pre_trained_model, dataset_mean, dataset_var):
-        # For additional regularization, try setting drop_connect_rate here below
-        inputs = tf.keras.layers.Input(shape=input_res + (3,))
-        pre_trained = pre_trained_model(input_tensor=inputs,
-                                        input_shape=input_res + (3,),
-                                        weights='imagenet',
-                                        include_top=False,
-                                        pooling='avg')
-
-        pre_trained.layers[2].mean.assign(dataset_mean)
-        pre_trained.layers[2].variance.assign(dataset_var)
-
-        # Freeze the weights in the base model, to use it for transfer learning
-        pre_trained.trainable = False
-
-        # Append a final classification layer at the end of the base model (this will be trainable)
-        x = pre_trained(inputs)
-        x = Dense(1280 // 2, activation='sigmoid', name='dense_1')(x)
-        # x = tf.keras.layers.BatchNormalization()(x)
-        y_train_freq = metadata_train[variable_labels].sum(axis=0) / len(metadata_train)
-        if min(y_train_freq) == 0:
-            print(
-                'Some of the variables are never set to 1 in the training dataset. Increase the number of training samples.')
-            print(y_train_freq)
-            exit(-1)
-        bias_init = np.log(y_train_freq / (1 - y_train_freq)).to_numpy()
-        outputs = Dense(n_classes, activation='sigmoid', bias_initializer=tf.keras.initializers.Constant(bias_init),
-                        name='dense_final')(x)
-
-        model = Model(inputs=inputs, outputs=outputs)
-
-        return model, pre_trained
+    """
 
     """print()
     model.summary()
@@ -436,13 +458,6 @@ def main():
     """images = np.zeros(shape=(len(metadata_train), 224, 224), dtype=float)
     for i, file_name in enumerate(metadata_train['image_id']):
         images[i] = plt.imread(file_name)"""
-
-    def load_grayscale_image(file_name, *params):
-        image = tf.io.read_file(file_name)
-        image = tf.io.decode_png(image)
-        image = tf.cast(image, dtype=tf.float32)
-        image = image / 255.
-        return (image,) + params
 
     stats_pipeline = tf.data.Dataset.from_tensor_slices((metadata_train['image_id'],))
     stats_pipeline = stats_pipeline.map(load_grayscale_image, num_parallel_calls=tf.data.AUTOTUNE)
@@ -492,47 +507,6 @@ def main():
     # if vis_batches:
     #    display_by_batch(dataset_train)
 
-    class CheckpointEpoch(tf.keras.callbacks.Callback):
-        def __init__(self, file_name_stem):
-            super(CheckpointEpoch, self).__init__()
-            self.file_name_stem = file_name_stem
-
-        def on_epoch_end(self, epoch, logs=None):
-            tf.keras.models.save_model(model=self.model,
-                                       filepath=self.file_name_stem + '.h5.tmp',
-                                       save_format='h5')
-            if Path(self.file_name_stem + '.h5').is_file():
-                # rmtree(self.file_name_stem + '.prev.h5', ignore_errors=True)
-                Path(self.file_name_stem + '.h5').replace(self.file_name_stem + '.prev.h5', )
-            Path(self.file_name_stem + '.h5.tmp').replace(self.file_name_stem + '.h5', )
-
-    class CheckpointBestModel(tf.keras.callbacks.Callback):
-        def __init__(self, file_name_stem, metric_key, optimization_direction):
-            super(CheckpointBestModel, self).__init__()
-            assert optimization_direction in ['min', 'max']
-            self.optimization_direction = optimization_direction
-            self.metric_key = metric_key
-            self.best_so_far = float('inf') if optimization_direction == 'min' else float('-inf')
-            self.epoch = 0  # Epochs are numbered starting from 0, consistent with Tensorboard
-            self.best_epoch = None
-            self.model_file_name = None
-            self.file_name_stem = file_name_stem
-
-        def on_epoch_end(self, epoch, logs=None):
-            metric_value = logs[self.metric_key]
-            if (self.optimization_direction == 'max' and metric_value > self.best_so_far) or \
-                    (self.optimization_direction == 'min' and metric_value < self.best_so_far):
-                self.best_so_far = metric_value
-                self.best_epoch = self.epoch
-                new_model_file_name = models_dir + '/' + comp_label + '/' + self.file_name_stem + f'-{self.epoch}.h5'
-                print(
-                    f'Best epoch so far {self.best_epoch} with {self.optimization_direction} {self.metric_key} = {self.best_so_far} -Saving model in file {new_model_file_name}')
-                self.model.save(new_model_file_name)
-                if self.model_file_name is not None:
-                    Path(self.model_file_name).unlink()
-                self.model_file_name = new_model_file_name
-            self.epoch += 1
-
     def compile_model(model, learning_rate):
         model.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
@@ -542,19 +516,31 @@ def main():
                      tf.keras.metrics.AUC(multi_label=True, name='auc')])
         return model
 
-    def run_trial(params):
-        base_model_file_name, metadata_mean, metadata_var, train_batch_size, epochs, learning_rate, file_name_stem, \
-        metadata_train, metadata_val = [
-            params[key] for key in
-            ('base_model_file_name', 'metadata_mean', 'metadata_var', 'train_batch_size', 'epochs',
-             'learning_rate', 'file_name_stem', 'metadata_train', 'metadata_val')]
+    def train_and_validate(params):
+        '''
+        For every trial t, the best model goes into ./models/<comp label>/<base_model/ft_model>-trial<000t>.h5
+        Logs are in ./logs/<comp label>/<base_model/ft_model>-trial<000t>
+        Files to resume computation are in ./computation_states/<comp label>/:
+            <base_model/ft_model>_trials.pickle <- the state of hyperopt, to resume tuning
+            <base_model/ft_model>.h5   <- model of the last completed epoch, to resume training
+            <base_model/ft_model>.h5.prev <- model of the second last completed epoch
+            <base_model/ft_model>.pickle <- variables needed to resume computation that are not in the .h5 model
+            <base_model/ft_model>.pickle.prev <- previous file with the same
+            <base_model/ft_model>_best.h5   <- model with the best validation score up to the last completed epoch
+        '''
+        pre_trained_model_fname, metadata_mean, metadata_var, train_batch_size, epochs, learning_rate, file_name_stem, \
+        metadata_train, metadata_val = [params[key] for key in
+                                        ('pre_trained_model_fname', 'metadata_mean', 'metadata_var', 'train_batch_size',
+                                         'epochs', 'learning_rate', 'file_name_stem', 'metadata_train', 'metadata_val')]
+        # file_name_stem will be either 'base_model' or 'ft_model'
+        # Deduce the index of the last trial run (if any) from the names of the log directories
         matches = sorted(Path(logs_root + '/' + comp_label).glob(f'{file_name_stem}-*'))
         if not matches:
             trial_idx = 0
         else:
             last_file_name = str(matches[-1])
             trial_idx = int(last_file_name[-3:len(last_file_name)]) + 1
-        log_dir = logs_root + '/' + comp_label + '/{}-{:03d}'.format(file_name_stem, trial_idx)
+        log_dir = logs_root + '/' + comp_label + '/{}-{:04d}'.format(file_name_stem, trial_idx)
 
         print(f'\nRunning experiment {trial_idx} with parameters:')
         for key, value in params.items():
@@ -563,14 +549,25 @@ def main():
 
         print(f'\nLogging training and validation to directory {log_dir}')
 
-        if base_model_file_name is None:
+        ''' If the file name for a pre-trained base model was provided, then load it and fine tune it.
+        Otherwise instantiate a base model and train it'''
+        if pre_trained_model_fname is None:
+            # Calculate the bias to be used for proper initialization of the model last layer
+            y_train_freq = metadata_train[variable_labels].sum(axis=0) / len(metadata_train)
+            if min(y_train_freq) == 0:
+                print(
+                    'Some of the variables are never set to 1 in the training dataset. Increase the number of training samples.')
+                print(y_train_freq)
+                exit(-1)
+            bias_init = np.log(y_train_freq / (1 - y_train_freq)).to_numpy()
             model, _ = make_pre_trained_model(pre_trained_model=model_choice,
                                               dataset_mean=metadata_mean,
-                                              dataset_var=metadata_var)
+                                              dataset_var=metadata_var,
+                                              bias_init=bias_init)
         else:
             print(
-                f'\nReloading best model from file {base_model_fname} obtained during experiment {best_trial_idx + 1}/{n_trials_base}')
-            model = tf.keras.models.load_model(base_model_file_name)
+                f'\nReloading pre-trained model from file {pre_trained_model_fname}')
+            model = tf.keras.models.load_model(pre_trained_model_fname)
             ''' Ensure all layers are trainable, as model may have been saved with frozen weights after first training
             and before fine-tuning '''
             for layer in model.layers:
@@ -578,6 +575,7 @@ def main():
 
         model = compile_model(model, learning_rate=learning_rate)
 
+        # Make the pipelines for training and validation
         dataset_train = make_pipeline(file_names=metadata_train['image_id'],
                                       y=metadata_train[variable_labels],
                                       weights=metadata_train['weights'],
@@ -590,53 +588,42 @@ def main():
                                     weights=None,
                                     batch_size=val_batch_size,
                                     shuffle=False,
-                                    for_model=True) \
-            if metadata_val is not None else None
+                                    for_model=True)
 
-        tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir=log_dir,
-                                                        histogram_freq=1,
-                                                        profile_batch=(1, 8))
-        checkpoint_best_cb = CheckpointBestModel(file_name_stem=file_name_stem + f'-{trial_idx}',
-                                            metric_key='val_auc',
-                                            optimization_direction='max')
-        early_stopping_cb = tf.keras.callbacks.EarlyStopping(monitor='val_loss',
-                                                             patience=100,
-                                                             verbose=1,
-                                                             mode='min',
-                                                             restore_best_weights=False)
-        checkpoint_epoch_cb = CheckpointEpoch(file_name_stem=comp_state_dir+'/epoch_checkpoint')
-        callbacks = [tensorboard_cb] if metadata_val is None else [tensorboard_cb,
-                                                                   checkpoint_epoch_cb,
-                                                                   checkpoint_best_cb,
-                                                                   early_stopping_cb]
-        history = model.fit(dataset_train,
-                            epochs=epochs,
-                            validation_data=dataset_val,
-                            shuffle=False,  # Shuffling is already done on the dataset before it is being fed to fit()
-                            callbacks=callbacks,
-                            verbose=1)
+        ''' Train and validate the model. Here shuffle is set to False as the pipeline already shuffles the data if 
+        needed '''
+
+        tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1, profile_batch=0)
+        history = checkpointed_fit(model=model,
+                                   path_and_fname_stem=f'{comp_state_dir}/{file_name_stem}',
+                                   metric_key='val_auc',
+                                   optimization_direction='max',
+                                   patience=100,
+                                   max_epochs=epochs,
+                                   alpha=learning_rate,
+                                   decay=1.,
+                                   k=1.,
+                                   x=dataset_train,
+                                   epochs=epochs,
+                                   validation_data=dataset_val,
+                                   shuffle=False,
+                                   verbose=1,
+                                   callbacks=[tensorboard_cb])
 
         # Careful: keep argmax/argmin below set properly, based on the optimization direction of the metric
-        if metadata_val is None:
-            best_epoch = None
-            best_epoch_metric = float('NaN')
-        else:
-            best_epoch = np.argmax(history.history['val_auc'])
-            assert best_epoch == checkpoint_best_cb.best_epoch
-            assert (history.epochs_total[best_epoch] == best_epoch)
-            best_epoch_metric = history.history['val_auc'][best_epoch]
+        best_epoch = np.argmax(history.history['val_auc'])
+        assert (history.epoch[best_epoch] == best_epoch)
+        best_epoch_metric = history.history['val_auc'][best_epoch]
 
-        if metadata_val is None:
-            new_model_file_name = models_dir + '/' + comp_label + '/' + file_name_stem + '.h5'
-            print(f'\nSaving optimized model in {new_model_file_name}')
-            model.save(new_model_file_name)
-        else:
-            new_model_file_name = checkpoint_best_cb.model_file_name
+        ''' Take the model as optimized at the end of the epoch with the best validation score and make it
+        available in the models_dir directory '''
+        best_model_for_trial_fname = '{}/{}-trial{:04d}.h5'.format(models_dir, file_name_stem, trial_idx)
+        shutil.copyfile(f'{comp_state_dir}/{file_name_stem}_best.h5', best_model_for_trial_fname)
         # Hyperopt will minimize the loss below
         res = {'status': STATUS_OK,
                'loss': -best_epoch_metric,
                'history': history.history,
-               'model_file_name': new_model_file_name}
+               'model_file_name': best_model_for_trial_fname}
         return res
 
     print('\nOptimizing and validating base (pre-trained) model.')
@@ -649,18 +636,17 @@ def main():
         print(f'Trials for the base model will be saved in file {base_trials_fname}')
         trials = Trials()
 
-    params_space = {
-        'base_model_file_name': None,
-        'metadata_mean': mean_by_pixel,
-        'metadata_var': var_by_pixel,
-        'learning_rate': hp.loguniform('learning_rate', np.log(1e-4), np.log(1e-3)),
-        'train_batch_size': hp.choice('train_batch_size', train_batch_sizes),
-        'epochs': epochs_base_model,
-        'file_name_stem': 'base_model',
-        'metadata_train': metadata_train,
-        'metadata_val': metadata_val}
+    params_space = {'pre_trained_model_fname': None,
+                    'metadata_mean': mean_by_pixel,
+                    'metadata_var': var_by_pixel,
+                    'learning_rate': hp.loguniform('learning_rate', np.log(1e-4), np.log(1e-3)),
+                    'train_batch_size': hp.choice('train_batch_size', train_batch_sizes),
+                    'epochs': epochs_base_model,
+                    'file_name_stem': 'base_model',
+                    'metadata_train': metadata_train,
+                    'metadata_val': metadata_val}
 
-    best = fmin(fn=run_trial,
+    best = fmin(fn=train_and_validate,
                 space=params_space,
                 algo=tpe.suggest,
                 max_evals=n_trials_base,
@@ -670,7 +656,7 @@ def main():
                 rstate=np.random.RandomState(seed))
 
     best_trial_idx = np.argmin([result['loss'] for result in trials.results])
-    base_model_fname = trials.best_trial['result']['model_file_name']
+    best_base_model_fname = trials.results[best_trial_idx]['model_file_name']
 
     print('\nFine-tuning and validating model.')
     if Path(ft_trials_fname).is_file():
@@ -682,18 +668,17 @@ def main():
         print(f'Trials for fine-tuning of the model will be saved in file {ft_trials_fname}')
         trials_ft = Trials()
 
-    params_space_ft = {
-        'base_model_file_name': base_model_fname,
-        'metadata_mean': mean_by_pixel,
-        'metadata_var': var_by_pixel,
-        'learning_rate': hp.loguniform('learning_rate', np.log(1e-4), np.log(1e-3)),
-        'train_batch_size': hp.choice('train_batch_size', train_batch_sizes),
-        'epochs': epochs_ft,
-        'file_name_stem': 'fine_tuned_model',
-        'metadata_train': metadata_train,
-        'metadata_val': metadata_val}
+    params_space_ft = {'pre_trained_model_fname': best_base_model_fname,
+                       'metadata_mean': mean_by_pixel,
+                       'metadata_var': var_by_pixel,
+                       'learning_rate': hp.loguniform('learning_rate', np.log(1e-4), np.log(1e-3)),
+                       'train_batch_size': hp.choice('train_batch_size', train_batch_sizes),
+                       'epochs': epochs_ft,
+                       'file_name_stem': 'ft_model',
+                       'metadata_train': metadata_train,
+                       'metadata_val': metadata_val}
 
-    best_ft = fmin(fn=run_trial,
+    best_ft = fmin(fn=train_and_validate,
                    space=params_space_ft,
                    algo=tpe.suggest,
                    max_evals=n_trials_ft,
@@ -706,6 +691,9 @@ def main():
     ft_model_fname = trials_ft.best_trial['result']['model_file_name']
     print(
         f'\nBest fine-tuned model is in file {ft_model_fname}, result of experiment {best_trial_idx_ft + 1}/{n_trials_ft}')
+
+    exit(1)
+
     print('Retraining it on the whole trainig+validation dataset, for testing and inference.')
     metadata_dev = metadata_train.append(metadata_val)
     metadata_dev['weights'] = compute_sample_weights(metadata_dev, variable_labels)
@@ -751,12 +739,12 @@ if __name__ == '__main__':
     main()
 
 ''' TODO:
+Try a decaying learning rate (learning rate annealing)
 Save report in csv format
 Re-enable visualization of batches
 Verify that setting all weights to 1 is the same as no weights, also loss-wise
 Try caching at the end of the pipeline to fix the TB profiler issue, and let fit() do the shuffling
 Do k-fold x-validation on the final model
-Try a decaying learning rate (learning rate annealing)
 Verify proper metrics for multi-label problems
 Make the pipelines deterministic, check if any performance hit
 Convert images from grayscale to RGB in batches
