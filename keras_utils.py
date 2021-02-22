@@ -46,15 +46,16 @@ class CheckpointEpoch(tf.keras.callbacks.Callback):
 
         ''' If the last epoch had the best validation so far, then copy the saved model in a dedicated file,
         that can be loaded and used for testing and inference '''
-        metric_value = logs[self.metric_key]
-        if (self.optimization_direction == 'max' and metric_value > self.best_so_far) or \
-                (self.optimization_direction == 'min' and metric_value < self.best_so_far):
-            self.best_so_far = metric_value
-            self.best_epoch = epoch
-            new_model_file_name = self.file_name_stem + '_best.h5'
-            print(
-                f'Best epoch so far {self.best_epoch} with {self.optimization_direction} {self.metric_key} = {self.best_so_far} -Saving model in file {new_model_file_name}')
-            shutil.copyfile(self.file_name_stem + '.h5', self.file_name_stem + '_best.h5')
+        if self.metric_key is not None:
+            metric_value = logs[self.metric_key]
+            if (self.optimization_direction == 'max' and metric_value > self.best_so_far) or \
+                    (self.optimization_direction == 'min' and metric_value < self.best_so_far):
+                self.best_so_far = metric_value
+                self.best_epoch = epoch
+                new_model_file_name = self.file_name_stem + '_best.h5'
+                print(
+                    f'Best epoch so far {self.best_epoch} with {self.optimization_direction} {self.metric_key} = {self.best_so_far} -Saving model in file {new_model_file_name}')
+                shutil.copyfile(self.file_name_stem + '.h5', self.file_name_stem + '_best.h5')
 
         # Save those variables, needed to resume training from the last epoch, that are not saved with the model
         for k, v in logs.items():
@@ -74,7 +75,7 @@ class CheckpointEpoch(tf.keras.callbacks.Callback):
         if epoch + 1 >= self.max_epochs:  # epochs are numbered from 0
             print(f'\nStopping training as it has reached the maximum number of epochs {self.max_epochs}')
             self.model.stop_training = True
-        elif self.patience is not None and epoch - self.best_epoch > self.patience:
+        elif self.best_epoch is not None and self.patience is not None and epoch - self.best_epoch > self.patience:
             if self.patience == 0:
                 print('\nStopping training has there has been no improvement since the previous epoch.')
             else:
@@ -84,9 +85,11 @@ class CheckpointEpoch(tf.keras.callbacks.Callback):
     def on_train_end(self, logs=None):
         ''' Remove files with intermediate checkpoints of the optimization just completed. Keep only the .h5 file with
         the best validated model '''
+        # If not required to save the best model, as no evaluation metric was provided, then save the last epoch model
+        if self.metric_key is None:
+            shutil.copyfile(self.file_name_stem + '.h5', self.file_name_stem + '_best.h5')
         Path(self.file_name_stem + '.h5').unlink(missing_ok=True)
         Path(self.file_name_stem + '.h5.prev').unlink(missing_ok=True)
-        # Path(self.file_name_stem+'.pickle').unlink(missing_ok=True)
         Path(self.file_name_stem + '.pickle.prev').unlink(missing_ok=True)
 
 
@@ -133,7 +136,7 @@ def checkpointed_fit(model,
         history_history = pickled['history_history']
 
         # Check if the model has already met the criteria to stop training, and in case do not resume training
-        if (already_computed_epochs >= max_epochs) or (already_computed_epochs - best_epoch > patience):
+        if (already_computed_epochs >= max_epochs) or (best_epoch is not None and already_computed_epochs - best_epoch > patience):
             if already_computed_epochs >= max_epochs:
                 print(f'\nThe model has already been trained for the maximum number of epochs {max_epochs}.')
             elif already_computed_epochs - best_epoch > patience:
@@ -143,6 +146,7 @@ def checkpointed_fit(model,
                 assert False
             history = tf.keras.callbacks.History()
             history.history = history_history
+            history.model = model
             return history
         checkpoint_fname = path_and_fname_stem + '.h5'
         print(f'\nResuming optimization from the model loaded from {checkpoint_fname}')
@@ -173,3 +177,5 @@ def checkpointed_fit(model,
     if history.model is None:
         history.model = model
     return history
+
+

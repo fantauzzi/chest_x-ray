@@ -588,7 +588,8 @@ def main():
                                     weights=None,
                                     batch_size=val_batch_size,
                                     shuffle=False,
-                                    for_model=True)
+                                    for_model=True) \
+            if metadata_val is not None else None
 
         ''' Train and validate the model. Here shuffle is set to False as the pipeline already shuffles the data if 
         needed '''
@@ -597,7 +598,7 @@ def main():
         path_and_fname_stem = '{}/{}-{:04d}'.format(comp_state_dir, file_name_stem, trial_idx)
         history = checkpointed_fit(model=model,
                                    path_and_fname_stem=path_and_fname_stem,
-                                   metric_key='val_auc',
+                                   metric_key='val_auc' if metadata_val is not None else None,
                                    optimization_direction='max',
                                    patience=100,
                                    max_epochs=epochs,
@@ -611,18 +612,22 @@ def main():
                                    verbose=1,
                                    callbacks=[tensorboard_cb])
 
-        # Careful: keep argmax/argmin below set properly, based on the optimization direction of the metric
-        best_epoch = np.argmax(history.history['val_auc'])
-        # assert (history.epoch[best_epoch] == best_epoch)
-        best_epoch_metric = history.history['val_auc'][best_epoch]
+        if metadata_val is None:
+            best_epoch_metric = None
+        else:
+            # Careful: keep argmax/argmin below set properly, based on the optimization direction of the metric
+            best_epoch = np.argmax(history.history['val_auc'])
+            # assert (history.epoch[best_epoch] == best_epoch)
+            best_epoch_metric = history.history['val_auc'][best_epoch]
 
-        ''' Take the model as optimized at the end of the epoch with the best validation score and make it
-        available in the models_dir directory '''
+            ''' Take the model as optimized at the end of the epoch with the best validation score and make it
+            available in the models_dir directory '''
         best_model_for_trial_fname = '{}/{}-trial{:04d}.h5'.format(models_dir, file_name_stem, trial_idx)
         shutil.copyfile(f'{path_and_fname_stem}_best.h5', best_model_for_trial_fname)
+
         # Hyperopt will minimize the loss below
         res = {'status': STATUS_OK,
-               'loss': -best_epoch_metric,
+               'loss': -best_epoch_metric if best_epoch_metric is not None else None,
                'history': history.history,
                'model_file_name': best_model_for_trial_fname}
         return res
@@ -733,8 +738,7 @@ def main():
     folds_history.reset_index(inplace=True)
     folds_history.rename(mapper={'index': 'epoch'}, inplace=True, axis=1)
     folds_averages = folds_history.groupby('epoch').mean().drop(labels='fold', axis=1)
-
-    exit(0)
+    best_cv_epoch = np.argmax(folds_averages['val_auc'])
 
     print('Retraining it on the whole trainig+validation dataset, for testing and inference.')
 
@@ -743,7 +747,7 @@ def main():
                   'metadata_var': var_by_pixel,
                   'learning_rate': best_ft['learning_rate'],
                   'train_batch_size': train_batch_sizes[best_ft['train_batch_size']],
-                  'epochs': np.argmax(trials_ft.best_trial['result']['history']['val_auc']) + 1,
+                  'epochs': best_cv_epoch + 1,
                   'file_name_stem': 'final_model',
                   'trials': None,
                   'metadata_train': metadata_dev,
@@ -768,9 +772,9 @@ def main():
 
     final_model = tf.keras.models.load_model(res['model_file_name'])
     test_result = final_model.evaluate(dataset_eval,
-                                       callbacks=[tensorboard_cb],
-                                       return_dict=True,
-                                       verbose=1)
+                                     callbacks=[tensorboard_cb],
+                                     return_dict=True,
+                                     verbose=1)
     print(test_result)
 
 

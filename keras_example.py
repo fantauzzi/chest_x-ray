@@ -29,6 +29,8 @@
 import tensorflow as tf
 import tensorflow_datasets as tfds
 from keras_utils import checkpointed_fit
+from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
+import numpy as np
 
 # ## Step 1: Create your input pipeline
 # 
@@ -46,6 +48,7 @@ from keras_utils import checkpointed_fit
 
 # In[2]:
 
+seed = 42
 
 (ds_train, ds_test), ds_info = tfds.load(
     'mnist',
@@ -119,16 +122,15 @@ model.compile(
 
 
 
-
-checkpointed_fit(model=model,
-                 path_and_fname_stem='./epoch_checkpoint',
-                 metric_key='val_sparse_categorical_accuracy',
-                 optimization_direction='max',
-                 patience=100,
-                 max_epochs=20,
-                 alpha=.001,
-                 decay=.97,
-                 k=2.4,
-                 x=ds_train,
-                 epochs=20,
-                 validation_data=ds_test)
+history = checkpointed_fit(model=model,
+                           path_and_fname_stem='./comps/simple_model',
+                           metric_key='val_sparse_categorical_accuracy',
+                           optimization_direction='max',
+                           patience=100,
+                           max_epochs=20,
+                           alpha=.001,
+                           decay=.97,
+                           k=2.4,
+                           x=ds_train,
+                           epochs=20,
+                           validation_data=ds_test)
