@@ -133,13 +133,17 @@ def checkpointed_fit(model,
         history_history = pickled['history_history']
 
         # Check if the model has already met the criteria to stop training, and in case do not resume training
-        if already_computed_epochs >= max_epochs:
-            print(f'\nThe model has already been trained for the maximum number of epochs {max_epochs}.')
-            return None
-        if already_computed_epochs - best_epoch > patience:
-            print(
-                f'\nModel training already stopped after {already_computed_epochs} epoch(s) because it exceeded {patience} epoch(s) without improvement on metric {metric_key}.')
-            return None
+        if (already_computed_epochs >= max_epochs) or (already_computed_epochs - best_epoch > patience):
+            if already_computed_epochs >= max_epochs:
+                print(f'\nThe model has already been trained for the maximum number of epochs {max_epochs}.')
+            elif already_computed_epochs - best_epoch > patience:
+                print(
+                    f'\nModel training already stopped after {already_computed_epochs} epoch(s) because it exceeded {patience} epoch(s) without improvement on metric {metric_key}.')
+            else:
+                assert False
+            history = tf.keras.callbacks.History()
+            history.history = history_history
+            return history
         checkpoint_fname = path_and_fname_stem + '.h5'
         print(f'\nResuming optimization from the model loaded from {checkpoint_fname}')
         model = tf.keras.models.load_model(checkpoint_fname)

@@ -526,17 +526,23 @@ def main():
         metadata_train, metadata_val = [params[key] for key in
                                         ('pre_trained_model_fname', 'metadata_mean', 'metadata_var', 'train_batch_size',
                                          'epochs', 'learning_rate', 'file_name_stem', 'metadata_train', 'metadata_val')]
+        trials = params.get('trials', None)
+        trial_idx = 0 if trials is None else len(trials.trials) - 1
         # file_name_stem will be either 'base_model' or 'ft_model'
+        """
         # Deduce the index of the last trial run (if any) from the names of the log directories
         matches = sorted(Path(logs_root + '/' + comp_label).glob(f'{file_name_stem}-*'))
         if not matches:
             trial_idx = 0
         else:
             last_file_name = str(matches[-1])
-            trial_idx = int(last_file_name[-3:len(last_file_name)]) + 1
+            trial_idx = int(last_file_name[-3:len(last_file_name)]) + 1"""
         log_dir = logs_root + '/' + comp_label + '/{}-{:04d}'.format(file_name_stem, trial_idx)
 
-        print(f'\nRunning experiment {trial_idx} with parameters:')
+        if trials is None:
+            print(f'\nRunning experiment with parameters:')
+        else:
+            print(f'\nRunning experiment {trial_idx} with parameters:')
         for key, value in params.items():
             if key not in ('trials', 'metadata_train', 'metadata_val'):
                 print(f'{key} = {value}')
@@ -545,7 +551,7 @@ def main():
 
         ''' If the file name for a pre-trained base model was provided, then load it and fine tune it.
         Otherwise instantiate a base model and train it'''
-        if pre_trained_model_fname is None:
+        if pre_trained_model_fname is None:  # TODO consider moving this logic inside checkpointed_fit()
             # Calculate the bias to be used for proper initialization of the model last layer
             y_train_freq = metadata_train[variable_labels].sum(axis=0) / len(metadata_train)
             if min(y_train_freq) == 0:
@@ -607,7 +613,7 @@ def main():
 
         # Careful: keep argmax/argmin below set properly, based on the optimization direction of the metric
         best_epoch = np.argmax(history.history['val_auc'])
-        assert (history.epoch[best_epoch] == best_epoch)
+        # assert (history.epoch[best_epoch] == best_epoch)
         best_epoch_metric = history.history['val_auc'][best_epoch]
 
         ''' Take the model as optimized at the end of the epoch with the best validation score and make it
@@ -639,7 +645,8 @@ def main():
                     'epochs': epochs_base_model,
                     'file_name_stem': 'base_model',
                     'metadata_train': metadata_train,
-                    'metadata_val': metadata_val}
+                    'metadata_val': metadata_val,
+                    'trials': trials}
 
     best = fmin(fn=train_and_validate,
                 space=params_space,
@@ -671,7 +678,8 @@ def main():
                        'epochs': epochs_ft,
                        'file_name_stem': 'ft_model',
                        'metadata_train': metadata_train,
-                       'metadata_val': metadata_val}
+                       'metadata_val': metadata_val,
+                       'trials': trials_ft}
 
     best_ft = fmin(fn=train_and_validate,
                    space=params_space_ft,
@@ -704,12 +712,12 @@ def main():
     print(f'\nStarting {n_folds}-fold cross-validation of the selected model over the dev. set.')
     # TODO set this properly
     params_dev = {'pre_trained_model_fname': ft_model_fname,
-                        'metadata_mean': mean_by_pixel,
-                        'metadata_var': var_by_pixel,
-                        'learning_rate': best_ft['learning_rate'],
-                        'train_batch_size': train_batch_sizes[best_ft['train_batch_size']],
-                        'epochs': epochs_cv,
-                        'trials': None}
+                  'metadata_mean': mean_by_pixel,
+                  'metadata_var': var_by_pixel,
+                  'learning_rate': best_ft['learning_rate'],
+                  'train_batch_size': train_batch_sizes[best_ft['train_batch_size']],
+                  'epochs': epochs_cv,
+                  'trials': None}
     folds_history = None
     for k in range(n_folds):
         print(f'\nFold {k} of cross-validation')
@@ -717,7 +725,7 @@ def main():
         params_dev['metadata_train'] = metadata_dev.iloc[training_folds[k]]
         params_dev['metadata_val'] = metadata_dev.iloc[validation_folds[k]]
         res = train_and_validate(params_dev)
-        res['history']['fold'] = [k]*len(res['history']['loss'])
+        res['history']['fold'] = [k] * len(res['history']['loss'])
         res_df = pd.DataFrame(res['history'])
         folds_history = res_df if folds_history is None else folds_history.append(res_df)
 
@@ -728,19 +736,18 @@ def main():
 
     exit(0)
 
-
     print('Retraining it on the whole trainig+validation dataset, for testing and inference.')
 
     params_dev = {'pre_trained_model_fname': ft_model_fname,
-                        'metadata_mean': mean_by_pixel,
-                        'metadata_var': var_by_pixel,
-                        'learning_rate': best_ft['learning_rate'],
-                        'train_batch_size': train_batch_sizes[best_ft['train_batch_size']],
-                        'epochs': np.argmax(trials_ft.best_trial['result']['history']['val_auc']) + 1,
-                        'file_name_stem': 'final_model',
-                        'trials': None,
-                        'metadata_train': metadata_dev,
-                        'metadata_val': None}
+                  'metadata_mean': mean_by_pixel,
+                  'metadata_var': var_by_pixel,
+                  'learning_rate': best_ft['learning_rate'],
+                  'train_batch_size': train_batch_sizes[best_ft['train_batch_size']],
+                  'epochs': np.argmax(trials_ft.best_trial['result']['history']['val_auc']) + 1,
+                  'file_name_stem': 'final_model',
+                  'trials': None,
+                  'metadata_train': metadata_dev,
+                  'metadata_val': None}
 
     res = train_and_validate(params_dev)
     print(
