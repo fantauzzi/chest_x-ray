@@ -1,7 +1,7 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 import tensorflow as tf
 from tensorflow.keras.layers import Dense
 from tensorflow.keras.models import Model
@@ -28,7 +28,7 @@ aug_dir = dataset_root + '/aug-train'  # Where generated augmented images will b
 logs_root = './logs'  # Logs for Tensorboard will be organized in subdirs. within this dir.
 metadata_pickle_fname = dataset_root + '/metadata.pickle'
 base_trials_fname = comp_state_dir + '/base_model_trials.pickle'
-ft_trials_fname = comp_state_dir + '/fine_tuned_model_trials.pickle'
+ft_trials_fname = comp_state_dir + '/ft_model_trials.pickle'
 
 ''' For input resolution, check here, based on the choice of EfficientNet:
  https://keras.io/examples/vision/image_classification_efficientnet_fine_tuning/ '''
@@ -46,9 +46,11 @@ n_trials_base = 3  # Number of experiments to be run
 n_trials_ft = 3
 epochs_base_model = 5  # Max number of epochs with the base network frozen (for transfer learning)
 epochs_ft = 5  # Max number of epochs for fine-tuning
+epochs_cv = 5
 ''' Set to true to display all the (augmented or not) training samples in a grid, one line per batch. Samples
 are shown the way they would be just before being fed to the model. Should be used in conjunction with 
 limit_samples'''
+n_folds = 5
 vis_batches = False
 print_base_model_summary = False
 p_test = .15  # Proportion of the dataset to be held out for test (test set)
@@ -229,14 +231,6 @@ def make_pre_trained_model(pre_trained_model, dataset_mean, dataset_var, bias_in
     # Append a final classification layer at the end of the base model (this will be trainable)
     x = pre_trained(inputs)
     x = Dense(1280 // 2, activation='sigmoid', name='dense_1')(x)
-    # x = tf.keras.layers.BatchNormalization()(x)
-    """y_train_freq = metadata_train[variable_labels].sum(axis=0) / len(metadata_train)
-    if min(y_train_freq) == 0:
-        print(
-            'Some of the variables are never set to 1 in the training dataset. Increase the number of training samples.')
-        print(y_train_freq)
-        exit(-1)
-    bias_init = np.log(y_train_freq / (1 - y_train_freq)).to_numpy()"""
     outputs = Dense(n_classes, activation='sigmoid', bias_initializer=tf.keras.initializers.Constant(bias_init),
                     name='dense_final')(x)
 
@@ -594,8 +588,9 @@ def main():
         needed '''
 
         tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1, profile_batch=0)
+        path_and_fname_stem = '{}/{}-{:04d}'.format(comp_state_dir, file_name_stem, trial_idx)
         history = checkpointed_fit(model=model,
-                                   path_and_fname_stem=f'{comp_state_dir}/{file_name_stem}',
+                                   path_and_fname_stem=path_and_fname_stem,
                                    metric_key='val_auc',
                                    optimization_direction='max',
                                    patience=100,
@@ -618,7 +613,7 @@ def main():
         ''' Take the model as optimized at the end of the epoch with the best validation score and make it
         available in the models_dir directory '''
         best_model_for_trial_fname = '{}/{}-trial{:04d}.h5'.format(models_dir, file_name_stem, trial_idx)
-        shutil.copyfile(f'{comp_state_dir}/{file_name_stem}_best.h5', best_model_for_trial_fname)
+        shutil.copyfile(f'{path_and_fname_stem}_best.h5', best_model_for_trial_fname)
         # Hyperopt will minimize the loss below
         res = {'status': STATUS_OK,
                'loss': -best_epoch_metric,
@@ -692,14 +687,51 @@ def main():
     print(
         f'\nBest fine-tuned model is in file {ft_model_fname}, result of experiment {best_trial_idx_ft + 1}/{n_trials_ft}')
 
-    exit(1)
-
-    print('Retraining it on the whole trainig+validation dataset, for testing and inference.')
+    # Merge toghether training and validation set in one training set (dev set), and partition it for k-folds x-validation
     metadata_dev = metadata_train.append(metadata_val)
     metadata_dev['weights'] = compute_sample_weights(metadata_dev, variable_labels)
     metadata_dev = metadata_dev.sample(frac=1, random_state=seed)
+    print(f'Dev. set for cross-validation of final model contains {len(metadata_dev)} samples.')
 
-    params_space_dev = {'base_model_file_name': ft_model_fname,
+    # Make a Series that will be used for stratified partitioning of the dev set, making k-folds
+    for_stratification = pd.Series(metadata_dev[variable_labels].sum(axis=1) == 0, dtype=int)
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=False)
+    training_folds, validation_folds = [], []
+    for training, validation in skf.split(X=metadata_dev, y=for_stratification):
+        training_folds.append(training)
+        validation_folds.append(validation)
+
+    print(f'\nStarting {n_folds}-fold cross-validation of the selected model over the dev. set.')
+    # TODO set this properly
+    params_dev = {'pre_trained_model_fname': ft_model_fname,
+                        'metadata_mean': mean_by_pixel,
+                        'metadata_var': var_by_pixel,
+                        'learning_rate': best_ft['learning_rate'],
+                        'train_batch_size': train_batch_sizes[best_ft['train_batch_size']],
+                        'epochs': epochs_cv,
+                        'trials': None}
+    folds_history = None
+    for k in range(n_folds):
+        print(f'\nFold {k} of cross-validation')
+        params_dev['file_name_stem'] = 'cross_validated_{:02d}'.format(k)
+        params_dev['metadata_train'] = metadata_dev.iloc[training_folds[k]]
+        params_dev['metadata_val'] = metadata_dev.iloc[validation_folds[k]]
+        res = train_and_validate(params_dev)
+        res['history']['fold'] = [k]*len(res['history']['loss'])
+        res_df = pd.DataFrame(res['history'])
+        folds_history = res_df if folds_history is None else folds_history.append(res_df)
+
+    # folds_history['epoch'] = folds_history.index
+    folds_history.reset_index(inplace=True)
+    folds_history.rename(mapper={'index': 'epoch'}, inplace=True, axis=1)
+    folds_averages = folds_history.groupby('epoch').mean().drop(labels='fold', axis=1)
+
+    exit(0)
+
+
+    print('Retraining it on the whole trainig+validation dataset, for testing and inference.')
+
+    params_dev = {'pre_trained_model_fname': ft_model_fname,
                         'metadata_mean': mean_by_pixel,
                         'metadata_var': var_by_pixel,
                         'learning_rate': best_ft['learning_rate'],
@@ -710,7 +742,7 @@ def main():
                         'metadata_train': metadata_dev,
                         'metadata_val': None}
 
-    res = run_trial(params_space_dev)
+    res = train_and_validate(params_dev)
     print(
         f"Final model re-trained with loss {res['history']['loss'][-1]} and AUC {res['history']['auc'][-1]}")
 
@@ -741,7 +773,7 @@ if __name__ == '__main__':
 ''' TODO:
 Try a decaying learning rate (learning rate annealing)
 Save report in csv format
-Re-enable visualization of batches
+Re-enable visualization of batches (say, first 4 samples of 4 batches)
 Verify that setting all weights to 1 is the same as no weights, also loss-wise
 Try caching at the end of the pipeline to fix the TB profiler issue, and let fit() do the shuffling
 Do k-fold x-validation on the final model

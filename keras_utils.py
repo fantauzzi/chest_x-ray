@@ -84,11 +84,10 @@ class CheckpointEpoch(tf.keras.callbacks.Callback):
     def on_train_end(self, logs=None):
         ''' Remove files with intermediate checkpoints of the optimization just completed. Keep only the .h5 file with
         the best validated model '''
-        Path(self.file_name_stem+'.h5').unlink(missing_ok=True)
-        Path(self.file_name_stem+'.h5.prev').unlink(missing_ok=True)
-        Path(self.file_name_stem+'.pickle').unlink(missing_ok=True)
-        Path(self.file_name_stem+'.pickle.prev').unlink(missing_ok=True)
-
+        Path(self.file_name_stem + '.h5').unlink(missing_ok=True)
+        Path(self.file_name_stem + '.h5.prev').unlink(missing_ok=True)
+        # Path(self.file_name_stem+'.pickle').unlink(missing_ok=True)
+        Path(self.file_name_stem + '.pickle.prev').unlink(missing_ok=True)
 
 
 class LearningRateScheduler():
@@ -120,9 +119,8 @@ def checkpointed_fit(model,
     history_history = {}
 
     # Load a previously saved model, if it exists, and the corresponding pickled variables
-    checkpoint_fname = path_and_fname_stem + '.h5'
-    if Path(checkpoint_fname).is_file():
-        model = tf.keras.models.load_model(checkpoint_fname)
+    pickled_fname = path_and_fname_stem + '.pickle'
+    if Path(pickled_fname).is_file():
         with open(path_and_fname_stem + '.pickle', 'br') as pickle_f:
             pickled = pickle.load(pickle_f)
         # Total number of epochs the model has already been optimized for (>=1)
@@ -142,6 +140,9 @@ def checkpointed_fit(model,
             print(
                 f'\nModel training already stopped after {already_computed_epochs} epoch(s) because it exceeded {patience} epoch(s) without improvement on metric {metric_key}.')
             return None
+        checkpoint_fname = path_and_fname_stem + '.h5'
+        print(f'\nResuming optimization from the model loaded from {checkpoint_fname}')
+        model = tf.keras.models.load_model(checkpoint_fname)
 
         print(
             f'\nResuming training after epoch {already_computed_epochs}. So far the best model validation had {metric_key}={best_so_far} at epoch {best_epoch}.')
