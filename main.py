@@ -782,6 +782,7 @@ if __name__ == '__main__':
     main()
 
 ''' TODO:
+When starting the fine-tuning, it shouldn't resume from epoch 0, but from the latest one
 Try a decaying learning rate (learning rate annealing)
 Save report in csv format
 Re-enable visualization of batches (say, first 4 samples of 4 batches)
