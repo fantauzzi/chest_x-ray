@@ -129,6 +129,7 @@ class CheckpointEpoch(tf.keras.callbacks.Callback):
             updated_history[k] = self.history.get(k, []) + self.model.history.history[k]
         pickle_this = {'completed_epochs': epoch + 1,
                        'history': updated_history,
+                       'epoch': self.model.history.epoch,
                        'params': self.model.history.params,
                        'trainable': trainable}
         with open(self.tmp_vars_fname, 'bw') as pickle_f:
@@ -184,7 +185,7 @@ def resumable_fit(model, comp_dir, stem, compile_cb, **kwargs):
     '''
     ''' Check if files are available with the state of a previously interrupted or completed computation; if so, load 
     them '''
-    assert kwargs.get('initial_epoch') is None
+    # assert kwargs.get('initial_epoch') is None
     epochs = kwargs.get('epochs', 1)
     var_fname = f'{comp_dir}/{stem}_vars.pickle'
     model_fname = f'{comp_dir}/{stem}_model.h5'
@@ -192,8 +193,8 @@ def resumable_fit(model, comp_dir, stem, compile_cb, **kwargs):
     if Path(var_fname).is_file():
         with open(var_fname, 'rb') as pickle_f:
             pickled = pickle.load(pickle_f)
-        # TODO read the pickled variables here
-        completed_epochs = pickled['completed_epochs']
+        next_epoch = pickled['completed_epochs']
+        epoch = pickled['epoch']
         model = tf.keras.models.load_model(model_fname)
         trainable = pickled['trainable']
         assert len(trainable) == len(model.layers)
@@ -205,13 +206,14 @@ def resumable_fit(model, comp_dir, stem, compile_cb, **kwargs):
         prev_history = tf.keras.callbacks.History()
         prev_history.history = pickled['history']
         prev_history.model = model
-        prev_history.epoch = list(range(completed_epochs))
+        prev_history.epoch = epoch
         prev_history.params = pickled['params']
         # If the requested number of epochs has been completed already, then stop here returning the results
-        if completed_epochs >= epochs:
+        if next_epoch >= epochs:
             return prev_history
-        # Model.fit() will compute these many epochs: epochs-initial_epoch
-        kwargs['initial_epoch'] = completed_epochs
+        # Model.fit() will compute these many epochs: kwargs['epochs']-kwargs['initial_epoch']
+        initial_epoch = kwargs.get('initial_epoch', epoch[0] if epoch else 0)
+        kwargs['initial_epoch'] = max(initial_epoch, next_epoch)
 
     # Prepare the call-backs necessary to checkpoint the computation at the end of every epoch
     checkpoint_cb = CheckpointEpoch(comp_dir=comp_dir,
@@ -329,3 +331,13 @@ def checkpointed_fit(model,
     if history.model is None:
         history.model = model
     return history
+
+
+''' TODO
+Allow an initial_epoch in the call to resumable_fit() and do recursion in the model to enable/disable layers at all depths 
+Add callback to keep and recover best trained model, or test the one provided with Keras
+Add proper initialization of bias in last layer
+Check class balancing
+Try variable learning rate/learning rate scheduling and check it plays nice with resumable training
+Add resumable tuning of hyperparameters
+'''

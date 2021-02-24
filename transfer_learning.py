@@ -414,6 +414,7 @@ history = resumable_fit(model,
                         compile_cb=compile_cb,
                         x=train_dataset,
                         epochs=initial_epochs,
+                        # validation_data=None)
                         validation_data=validation_dataset)
 
 # %%
@@ -505,9 +506,15 @@ As you are training a much larger model and want to readapt the pretrained weigh
 """
 
 # %%
-model.compile(loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
+
+compile_cb_fine = partial(compile_model, loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
+                          optimizer=tf.keras.optimizers.RMSprop(lr=base_learning_rate / 10),
+                          metrics=['accuracy'])
+compile_cb_fine(model)
+
+"""model.compile(loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
               optimizer=tf.keras.optimizers.RMSprop(lr=base_learning_rate / 10),
-              metrics=['accuracy'])
+              metrics=['accuracy'])"""
 
 # %%
 model.summary()
@@ -529,10 +536,19 @@ If you trained to convergence earlier, this step will improve your accuracy by a
 fine_tune_epochs = 10
 total_epochs = initial_epochs + fine_tune_epochs
 
-history_fine = model.fit(train_dataset,
+"""history_fine = model.fit(train_dataset,
                          epochs=total_epochs,
                          initial_epoch=history.epoch[-1]+1,
-                         validation_data=validation_dataset)
+                         validation_data=validation_dataset)"""
+
+history_fine = resumable_fit(model=model,
+                             comp_dir='./comp_state',
+                             stem='fine',
+                             compile_cb=compile_cb_fine,
+                             x=train_dataset,
+                             epochs=total_epochs,
+                             initial_epoch=history.epoch[-1] + 1,
+                             validation_data=validation_dataset)
 
 # %%
 """
