@@ -95,8 +95,8 @@ import matplotlib.pyplot as plt
 import os
 import tensorflow as tf
 from keras_utils import resumable_fit
-
 from tensorflow.keras.preprocessing import image_dataset_from_directory
+from functools import partial
 
 # %%
 """
@@ -353,7 +353,6 @@ Compile the model before training it. Since there are two classes, use a binary 
 
 # %%
 base_learning_rate = 0.0001
-from functools import partial
 
 
 def compile_model(model, **kwargs):
@@ -402,9 +401,26 @@ print("initial accuracy: {:.2f}".format(accuracy0))
                     epochs=initial_epochs,
                     validation_data=validation_dataset)"""
 
-tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir ='./logs/transfer_learning',
+tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir='./logs/transfer_learning',
                                                 histogram_freq=1,
-                                                profile_batch=0)
+                                                profile_batch=(2, 5))
+
+checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(filepath='./comp_state/transfer_learning_best.h5',
+                                                   monitor='val_accuracy',
+                                                   verbose=1,
+                                                   save_best_only=True,
+                                                   save_weights_only=False,
+                                                   mode='auto',
+                                                   save_freq='epoch')
+
+
+# Note: using parameter 'lr' in computing the value to be returned is not compatible with resuming the computation
+def exp_decaying_lr(epoch, lr, initial, decay, k):
+    lr = initial * (decay ** (epoch / k))
+    return lr
+
+learning_rate_cb = tf.keras.callbacks.LearningRateScheduler(
+    partial(exp_decaying_lr, initial=base_learning_rate, decay=.96, k=2.), verbose=1)
 
 history = resumable_fit(model,
                         comp_dir='./comp_state',
@@ -413,7 +429,7 @@ history = resumable_fit(model,
                         x=train_dataset,
                         epochs=initial_epochs,
                         validation_data=validation_dataset,
-                        callbacks=[tensorboard_cb])
+                        callbacks=[tensorboard_cb, checkpoint_cb, learning_rate_cb])
 
 # %%
 """
@@ -423,7 +439,8 @@ Let's take a look at the learning curves of the training and validation accuracy
 """
 
 # Re-loading the model from disk is a workaround for the spike in training loss at the first epoch of fine-tuning
-model = tf.keras.models.load_model('./comp_state/transfer_learning_model.h5')
+# model = tf.keras.models.load_model('./comp_state/transfer_learning_model.h5')
+model = tf.keras.models.load_model('./comp_state/transfer_learning_best.h5')
 base_model = model.layers[4]
 # %%
 acc = history.history['accuracy']
@@ -539,6 +556,14 @@ total_epochs = initial_epochs + fine_tune_epochs
                          initial_epoch=history.epoch[-1]+1,
                          validation_data=validation_dataset)"""
 
+checkpoint_cb_fine = tf.keras.callbacks.ModelCheckpoint(filepath='./comp_state/fine_best.h5',
+                                                        monitor='val_accuracy',
+                                                        verbose=1,
+                                                        save_best_only=True,
+                                                        save_weights_only=False,
+                                                        mode='auto',
+                                                        save_freq='epoch')
+
 history_fine = resumable_fit(model=model,
                              comp_dir='./comp_state',
                              stem='fine',
@@ -547,7 +572,7 @@ history_fine = resumable_fit(model=model,
                              epochs=total_epochs,
                              initial_epoch=history.epoch[-1] + 1,
                              validation_data=validation_dataset,
-                             callbacks=[tensorboard_cb])
+                             callbacks=[tensorboard_cb, checkpoint_cb_fine])
 
 # %%
 """

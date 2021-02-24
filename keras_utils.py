@@ -141,9 +141,10 @@ class CheckpointEpoch(tf.keras.callbacks.Callback):
         self.prev_model_fname = self.model_fname + '.prev'
         self.history = {} if history is None else deepcopy(history)
         self.epochs_in_history = 0 if not self.history else len(next(iter(self.history.values())))
+        self.model_checkpoint_cb = None
 
     def save_checkpoint(self, epoch, logs):
-        # trainable = [layer.trainable for layer in self.model.layers]
+        # Pickle variables that are needed to restore the computation but are not saved in a .h5 file
         trainable = collect_trainable_states(self.model.layers)
         updated_history = {}
         for k, v in self.model.history.history.items():
@@ -152,10 +153,13 @@ class CheckpointEpoch(tf.keras.callbacks.Callback):
                        'epoch': self.model.history.epoch,
                        'params': self.model.history.params,
                        'trainable': trainable}
+        if self.model_checkpoint_cb is not None:
+            pickle_this['epochs_since_last_save'] = self.model_checkpoint_cb.epochs_since_last_save
+            pickle_this['best'] = self.model_checkpoint_cb.best
         with open(self.tmp_vars_fname, 'bw') as pickle_f:
             pickle.dump(pickle_this, file=pickle_f, protocol=pickle.HIGHEST_PROTOCOL)
         keep_last_two_files(self.vars_fname)
-        # Note: save_format='tf' would be much slower
+        # Save the model to be able to resume the computation. Note: save_format='tf' would be much slower
         tf.keras.models.save_model(self.model, filepath=self.tmp_model_fname, save_format='h5')
         keep_last_two_files(self.model_fname)
 
@@ -164,6 +168,7 @@ class CheckpointEpoch(tf.keras.callbacks.Callback):
 
     def on_epoch_begin(self, epoch, logs=None):
         if self.model.history.epoch:
+            # Save a checkpoint with the previous epoch (the last epoch that completed)
             self.save_checkpoint(epoch=epoch - 1, logs=logs)
 
     def on_train_end(self, logs=None):
@@ -191,11 +196,27 @@ def resumable_fit(model, comp_dir, stem, compile_cb, **kwargs):
     '''
     ''' Check if files are available with the state of a previously interrupted or completed computation; if so, load 
     them '''
-    # assert kwargs.get('initial_epoch') is None
     epochs = kwargs.get('epochs', 1)
     var_fname = f'{comp_dir}/{stem}_vars.pickle'
     model_fname = f'{comp_dir}/{stem}_model.h5'
     prev_history = None
+
+    # Prepare the call-backs necessary to checkpoint the computation at the end of every epoch
+    checkpoint_cb = CheckpointEpoch(comp_dir=comp_dir,
+                                    stem=stem,
+                                    history=prev_history.history if prev_history is not None else None)
+    callbacks = kwargs.get('callbacks', [])
+    callbacks.append(checkpoint_cb)
+    kwargs['callbacks'] = callbacks
+
+    # Look for a Keras ModelCheckpoint callback among the provided callbacks, if any
+    model_checkpoint_cb = None
+    for cb in callbacks:
+        if isinstance(cb, tf.keras.callbacks.ModelCheckpoint):
+            checkpoint_cb.model_checkpoint_cb = cb
+            model_checkpoint_cb = cb
+            break
+
     if Path(var_fname).is_file():
         with open(var_fname, 'rb') as pickle_f:
             pickled = pickle.load(pickle_f)
@@ -224,14 +245,11 @@ def resumable_fit(model, comp_dir, stem, compile_cb, **kwargs):
         # Model.fit() will compute these many epochs: kwargs['epochs']-kwargs['initial_epoch']
         initial_epoch = kwargs.get('initial_epoch', epoch[0] if epoch else 0)
         kwargs['initial_epoch'] = max(initial_epoch, next_epoch)
-
-    # Prepare the call-backs necessary to checkpoint the computation at the end of every epoch
-    checkpoint_cb = CheckpointEpoch(comp_dir=comp_dir,
-                                    stem=stem,
-                                    history=prev_history.history if prev_history is not None else None)
-    callbacks = kwargs.get('callbacks', [])
-    callbacks.append(checkpoint_cb)
-    kwargs['callbacks'] = callbacks
+        ''' If there is a Keras ModelCheckpoint callback among the callbacks, the update its state to resume the 
+        computation from where it was interrupted '''
+        if model_checkpoint_cb is not None:
+            model_checkpoint_cb.epochs_since_last_save = pickled['epochs_since_last_save']
+            model_checkpoint_cb.best = pickled['best']
 
     # Fit the model
     history = model.fit(**kwargs)
@@ -344,9 +362,9 @@ def checkpointed_fit(model,
 
 
 ''' TODO
-Add callback to keep and recover best trained model, or test the one provided with Keras
-Add proper initialization of bias in last layer
-Check class balancing
 Try variable learning rate/learning rate scheduling and check it plays nice with resumable training
 Add resumable tuning of hyperparameters
+
+Add proper initialization of bias in last layer
+Check class balancing
 '''
