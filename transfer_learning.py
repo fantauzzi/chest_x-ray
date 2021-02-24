@@ -92,9 +92,9 @@ You will follow the general machine learning workflow.
 
 # %%
 import matplotlib.pyplot as plt
-import numpy as np
 import os
 import tensorflow as tf
+from keras_utils import resumable_fit
 
 from tensorflow.keras.preprocessing import image_dataset_from_directory
 
@@ -400,13 +400,11 @@ print("initial accuracy: {:.2f}".format(accuracy0))
 
 """history = model.fit(train_dataset,
                     epochs=initial_epochs,
-                    validation_data=validation_dataset)
+                    validation_data=validation_dataset)"""
 
-tf.keras.models.save_model(model, filepath='./my_model.h5', save_format='h5')
-model = tf.keras.models.load_model('./my_model.h5')"""
-# assert(model.layers[4].trainable)
-# model.layers[4].trainable = False
-from keras_utils import resumable_fit
+tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir ='./logs/transfer_learning',
+                                                histogram_freq=1,
+                                                profile_batch=0)
 
 history = resumable_fit(model,
                         comp_dir='./comp_state',
@@ -414,8 +412,8 @@ history = resumable_fit(model,
                         compile_cb=compile_cb,
                         x=train_dataset,
                         epochs=initial_epochs,
-                        # validation_data=None)
-                        validation_data=validation_dataset)
+                        validation_data=validation_dataset,
+                        callbacks=[tensorboard_cb])
 
 # %%
 """
@@ -548,7 +546,8 @@ history_fine = resumable_fit(model=model,
                              x=train_dataset,
                              epochs=total_epochs,
                              initial_epoch=history.epoch[-1] + 1,
-                             validation_data=validation_dataset)
+                             validation_data=validation_dataset,
+                             callbacks=[tensorboard_cb])
 
 # %%
 """

@@ -121,7 +121,7 @@ def set_trainable_states(layers, names_and_state, idx=0):
     for layer in layers:
         if hasattr(layer, 'trainable'):
             name, layer.trainable = names_and_state[idx]
-            assert(layer.name == name)
+            assert (layer.name == name)
             idx = idx + 1
         if hasattr(layer, 'layers'):
             idx = set_trainable_states(layer.layers, names_and_state, idx)
@@ -148,8 +148,7 @@ class CheckpointEpoch(tf.keras.callbacks.Callback):
         updated_history = {}
         for k, v in self.model.history.history.items():
             updated_history[k] = self.history.get(k, []) + self.model.history.history[k]
-        pickle_this = {'completed_epochs': epoch + 1,
-                       'history': updated_history,
+        pickle_this = {'history': updated_history,
                        'epoch': self.model.history.epoch,
                        'params': self.model.history.params,
                        'trainable': trainable}
@@ -200,14 +199,14 @@ def resumable_fit(model, comp_dir, stem, compile_cb, **kwargs):
     if Path(var_fname).is_file():
         with open(var_fname, 'rb') as pickle_f:
             pickled = pickle.load(pickle_f)
-        next_epoch = pickled['completed_epochs']
         epoch = pickled['epoch']
+        next_epoch = epoch[-1] + 1
         model = tf.keras.models.load_model(model_fname)
         trainable = pickled['trainable']
         ''' After the model has been loaded, all its layers are trainable by default. If there is at least one layer
         that should not be trainable (as indicated in `trainable`) then go through every layer and set its `trainable`
         attribute as needed '''
-        total_trainable = reduce(lambda partial_sum, item: partial_sum+item[1], trainable, 0)
+        total_trainable = reduce(lambda partial_sum, item: partial_sum + item[1], trainable, 0)
         ''' If any layer is set to not trainable, then the model must be compiled again, to apply the changes; make
         sure then that there is a callback to recompile the model '''
         if total_trainable < len(trainable):
