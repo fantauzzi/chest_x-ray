@@ -3,6 +3,7 @@ from pathlib import Path
 import pickle
 import shutil
 from copy import deepcopy
+from functools import reduce
 
 
 def keep_last_two_files(file_name):
@@ -105,6 +106,28 @@ class LearningRateScheduler():
         return updated_lr
 
 
+def collect_trainable_states(layers):
+    res = []
+    for layer in layers:
+        if hasattr(layer, 'trainable'):
+            res.append((layer.name, layer.trainable))
+        if hasattr(layer, 'layers'):
+            layer_res = collect_trainable_states(layer.layers)
+            res.extend(layer_res)
+    return res
+
+
+def set_trainable_states(layers, names_and_state, idx=0):
+    for layer in layers:
+        if hasattr(layer, 'trainable'):
+            name, layer.trainable = names_and_state[idx]
+            assert(layer.name == name)
+            idx = idx + 1
+        if hasattr(layer, 'layers'):
+            idx = set_trainable_states(layer.layers, names_and_state, idx)
+    return idx
+
+
 class CheckpointEpoch(tf.keras.callbacks.Callback):
     def __init__(self, comp_dir, stem, history):
         super(CheckpointEpoch, self).__init__()
@@ -119,11 +142,9 @@ class CheckpointEpoch(tf.keras.callbacks.Callback):
         self.history = {} if history is None else deepcopy(history)
         self.epochs_in_history = 0 if not self.history else len(next(iter(self.history.values())))
 
-    def on_train_begin(self, logs=None):
-        Path(self.comp_dir).mkdir(parents=True, exist_ok=True)
-
     def save_checkpoint(self, epoch, logs):
-        trainable = [layer.trainable for layer in self.model.layers]
+        # trainable = [layer.trainable for layer in self.model.layers]
+        trainable = collect_trainable_states(self.model.layers)
         updated_history = {}
         for k, v in self.model.history.history.items():
             updated_history[k] = self.history.get(k, []) + self.model.history.history[k]
@@ -139,26 +160,12 @@ class CheckpointEpoch(tf.keras.callbacks.Callback):
         tf.keras.models.save_model(self.model, filepath=self.tmp_model_fname, save_format='h5')
         keep_last_two_files(self.model_fname)
 
+    def on_train_begin(self, logs=None):
+        Path(self.comp_dir).mkdir(parents=True, exist_ok=True)
+
     def on_epoch_begin(self, epoch, logs=None):
         if self.model.history.epoch:
             self.save_checkpoint(epoch=epoch - 1, logs=logs)
-
-    def on_epoch_end(self, epoch, logs=None):
-        pass
-        """print('\nOn epoch end', epoch)
-        for k, v in logs.items():
-            self.history.setdefault(k, []).append(v)
-        trainable = [layer.trainable for layer in self.model.layers]
-        pickle_this = {'completed_epochs': epoch + 1,
-                       'history': self.history,
-                       'params': self.model.history.params,
-                       'trainable': trainable}
-        with open(self.tmp_vars_fname, 'bw') as pickle_f:
-            pickle.dump(pickle_this, file=pickle_f, protocol=pickle.HIGHEST_PROTOCOL)
-        keep_last_two_files(self.vars_fname)
-        # Note: save_format='tf' would be much slower
-        tf.keras.models.save_model(self.model, filepath=self.tmp_model_fname, save_format='h5')
-        keep_last_two_files(self.model_fname)"""
 
     def on_train_end(self, logs=None):
         # Save a checkpoint with the last epoch
@@ -197,11 +204,15 @@ def resumable_fit(model, comp_dir, stem, compile_cb, **kwargs):
         epoch = pickled['epoch']
         model = tf.keras.models.load_model(model_fname)
         trainable = pickled['trainable']
-        assert len(trainable) == len(model.layers)
-        if sum(trainable) < len(trainable):
+        ''' After the model has been loaded, all its layers are trainable by default. If there is at least one layer
+        that should not be trainable (as indicated in `trainable`) then go through every layer and set its `trainable`
+        attribute as needed '''
+        total_trainable = reduce(lambda partial_sum, item: partial_sum+item[1], trainable, 0)
+        ''' If any layer is set to not trainable, then the model must be compiled again, to apply the changes; make
+        sure then that there is a callback to recompile the model '''
+        if total_trainable < len(trainable):
             assert (compile_cb is not None)
-            for layer, is_trainable in zip(model.layers, trainable):
-                layer.trainable = is_trainable
+            set_trainable_states(model.layers, trainable)
             compile_cb(model)
         prev_history = tf.keras.callbacks.History()
         prev_history.history = pickled['history']
@@ -334,7 +345,6 @@ def checkpointed_fit(model,
 
 
 ''' TODO
-Allow an initial_epoch in the call to resumable_fit() and do recursion in the model to enable/disable layers at all depths 
 Add callback to keep and recover best trained model, or test the one provided with Keras
 Add proper initialization of bias in last layer
 Check class balancing
