@@ -94,7 +94,7 @@ You will follow the general machine learning workflow.
 import matplotlib.pyplot as plt
 import os
 import tensorflow as tf
-from keras_utils import resumable_fit, Trainer
+from keras_utils import resumable_fit, Trainer, EWA_LearningRateScheduler
 from tensorflow.keras.preprocessing import image_dataset_from_directory
 from functools import partial
 from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
@@ -366,7 +366,7 @@ def compile_model(model, **kwargs):
 compile_cb = partial(compile_model, optimizer=tf.keras.optimizers.Adam(lr=base_learning_rate),
                      loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
                      metrics=['accuracy'])
-compile_cb(model)
+# compile_cb(model)
 """model.compile(optimizer=tf.keras.optimizers.Adam(lr=base_learning_rate),
               loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
               metrics=['accuracy'])"""
@@ -392,13 +392,13 @@ After training for 10 epochs, you should see ~94% accuracy on the validation set
 
 # %%
 initial_epochs = 10
-
+"""
 loss0, accuracy0 = model.evaluate(validation_dataset)
 
 # %%
 print("initial loss: {:.2f}".format(loss0))
 print("initial accuracy: {:.2f}".format(accuracy0))
-
+"""
 # %%
 
 """history = model.fit(train_dataset,
@@ -417,15 +417,16 @@ checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(filepath='./comp_state/transf
                                                    mode='auto',
                                                    save_freq='epoch')
 
+learning_rate_cb = EWA_LearningRateScheduler(verbose=1)
 
 # Note: using parameter 'lr' in computing the value to be returned is not compatible with resuming the computation
-def exp_decaying_lr(epoch, lr, initial, decay, k):
+"""def exp_decaying_lr(epoch, lr, initial, decay, k):
     lr = initial * (decay ** (epoch / k))
     return lr
 
 
 learning_rate_cb = tf.keras.callbacks.LearningRateScheduler(
-    partial(exp_decaying_lr, initial=base_learning_rate, decay=.96, k=2.), verbose=1)
+    partial(exp_decaying_lr, initial=base_learning_rate, decay=.96, k=2.), verbose=1)"""
 
 """history = resumable_fit(model,
                         comp_dir='./comp_state',
@@ -439,17 +440,25 @@ learning_rate_cb = tf.keras.callbacks.LearningRateScheduler(
 hp_space = {'x': train_dataset,
             'epochs': initial_epochs,
             'validation_data': validation_dataset,
+            'alpha': hp.loguniform('learning_rate', np.log(1e-4), np.log(1e-3)),
+            'decay': .96,
+            'k': 2.,
             'callbacks': [tensorboard_cb, checkpoint_cb, learning_rate_cb]}
+
+# 'train_batch_size': hp.choice('train_batch_size', train_batch_sizes),
 
 trainer = Trainer(model=model,
                   compile_cb=compile_cb,
                   comp_dir='./comp_state',
                   stem='transfer_learning',
                   space=hp_space,
+                  val_metric='val_accuracy',
+                  optimization_direction='max',
                   log_dir='./logs')
 # Note: if `space` only contains constants, no random variables to sample, then `res` here below will be {}
 res = trainer.do_it(max_evals=3, algo=tpe.suggest, show_progressbar=False, rstate=np.random.RandomState(seed))
-
+print(res)
+exit(0)
 # %%
 """
 ### Learning curves

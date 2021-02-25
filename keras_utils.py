@@ -12,8 +12,9 @@ def keep_last_two_files(file_name):
     Path(file_name + '.tmp').replace(file_name)
 
 
-class EWA_LearningRateScheduler():
-    def __init__(self, alpha, decay, k):
+class EWA_LearningRateScheduler(tf.keras.callbacks.LearningRateScheduler):
+    def __init__(self, alpha=3e-4, decay=1., k=1., verbose=0):
+        super(EWA_LearningRateScheduler, self).__init__(schedule=self.update, verbose=verbose)
         self.alpha = alpha
         self.decay = decay
         self.k = k
@@ -189,10 +190,11 @@ def resumable_fit(model, comp_dir, stem, compile_cb, **kwargs):
 
 
 class Trainer():
-    def __init__(self, model, compile_cb, comp_dir, stem, space, log_dir = None):
+    def __init__(self, model, compile_cb, comp_dir, stem, space, val_metric, optimization_direction, log_dir=None):
         '''
         An object that implements a callback for hp.tfmin(), and provides it with a state
         '''
+        assert (optimization_direction in ('min', 'max'))
         self.max_evals = None
         ''' Try to load the trials object from the file system (to resume an interrupted computation, or recover the 
         result of a completed one); if it fails, then instantiate a new one (start a new computation) '''
@@ -203,57 +205,93 @@ class Trainer():
         else:
             self.trials = Trials()
         self.model = model
+        self.saved_model_fname = None
         self.compile_cb = compile_cb
         self.comp_dir = comp_dir
         self.stem = stem
         self.space = space
         self.trial = None
         self.log_dir = log_dir
+        self.val_metric = val_metric
+        self.optimization_direction = optimization_direction
 
     def make_trial_stem(self, stem, trial):
         trial_stem = '{}-{:04d}'.format(stem, trial)
         return trial_stem
 
-    """def on_trial_end(self, result, *args):
-        self.trial += 1
-        self.trial_stem = self.make_trial_stem(self.stem, self.trial)
-        return False, args"""
-
     def resumable_fit_wrapper(self, params):
         self.trial += 1
+        ''' If it is the first trial, checkpoint the model on disk before optimization starts. In subsequent trials,
+        reload the checkpointed model from disk, to ensure every run of the optimization process starts from the same
+        model and in the same state '''
+        if self.trial == 0:
+            self.compile_cb(self.model)
+            self.saved_model_fname = f'{self.comp_dir}/{self.stem}_orig.h5'
+            tf.keras.models.save_model(self.model, filepath=self.saved_model_fname, save_format='h5')
+        else:
+            self.model = tf.keras.models.load_model(self.saved_model_fname)
         trial_stem = self.make_trial_stem(self.stem, self.trial)
         best_model_for_trial_fname = self.comp_dir + '/' + self.make_trial_stem(self.stem, self.trial) + '_best.h5'
         ''' If there are Keras callbacks to checkpoint the best model and/or save logs for Tensorboard, set the 
         respective file names such that they contain the current trial number. This will ensure a different file
         name for every trial.'''
+        ''' Apply parameters from `params` to received callbacks as necessary '''
         callbacks = params.get('callbacks')
         if callbacks is not None:
             for cb in callbacks:
+                # File name for the checkpoint with the best validated model of the trial
                 if isinstance(cb, tf.keras.callbacks.ModelCheckpoint):
                     cb.filepath = best_model_for_trial_fname
+                # Directory name for logs for Tensorboard
                 elif isinstance(cb, tf.keras.callbacks.TensorBoard):
-                    assert(self.log_dir is not None)
-                    cb.log_dir = self.log_dir +'/'+trial_stem
-        # TODO above also add the same treatement for the TB logs callback. May need to add an attribute to this class with the log_dir, initialized in the ctor
+                    assert (self.log_dir is not None)
+                    cb.log_dir = self.log_dir + '/' + trial_stem
+                # Parameters for EWA decaying learning rate
+                elif isinstance(cb, EWA_LearningRateScheduler):
+                    alpha = params.get('alpha')
+                    if alpha is not None:
+                        cb.alpha = alpha
+                        del params['alpha']
+                    decay = params.get('decay')
+                    if decay is not None:
+                        cb.decay = decay
+                        del params['decay']
+                    k = params.get('k')
+                    if k is not None:
+                        del params['k']
+                        cb.k = k
+
         history = resumable_fit(model=self.model,
                                 comp_dir=self.comp_dir,
                                 stem=trial_stem,
                                 compile_cb=self.compile_cb,
                                 **params)
 
-        best_epoch_metric = max(history.history['val_accuracy'])  # TODO this should not be hard-wired, make it configurable along with its optimization direction
+        ''' If this was the last trial, remove the file with the model checkpointed at the beginning of the first trial,
+        it is not needed anymore '''
+        if self.trial == self.max_evals - 1:
+            Path(self.saved_model_fname).unlink(missing_ok=True)
+            self.saved_model_fname = None
+
+        loss = -max(history.history[self.val_metric]) if self.optimization_direction == 'max' \
+            else min(history.history[self.val_metric])
+
         res = {'status': STATUS_OK,
-               'loss': -best_epoch_metric if best_epoch_metric is not None else None,
+               'loss': loss,
                'history': history.history,
-               'model_file_name': best_model_for_trial_fname}
+               'model_file_name': best_model_for_trial_fname,
+               'trial': self.trial}
 
         return res
 
     def do_it(self, max_evals, **kwargs):
         '''
-        The callback to be passed to hp.fmin() as its argument fn
-        :param kwargs: the parameters that the method receives from fmin()
-        :return: the return value requested by hp.fmin(), a dictionary with at least to keys 'status' and 'loss'
+        Runs a given number of optimizations, and optionally validations, optimizing the hyper-parameters.
+        :param max_evals: the number of runs to be used to optimize hyper-parameters, corresponds to parameter max_evals
+        of hyperopt.fmin().
+        :param kwargs: parameters to be passed to hyperopt.fmin(). They are not allowed to include any of these:
+        fn, space, max_evals, trials, trials_save_file.
+        :return: the return value of hyperopt.fmin(), a dictionary with at least two keys 'status' and 'loss'.
         '''
         for k, _ in kwargs.items():
             assert (k not in ('fn', 'space', 'max_evals', 'trials', 'trials_save_file'))
@@ -269,13 +307,9 @@ class Trainer():
                     trials_save_file=self.trials_fname,
                     **kwargs)
         return best
-        # algo = tpe.suggest,
-        # show_progressbar=False,
-        # rstate=np.random.RandomState(seed))
 
 
 ''' TODO
-Make sure the model is re-compiled, also with the right learning rate and other solver parameters, before every trial
 Try with proper hyperparameters tuning, to be sampled from random variables
 
 Add proper initialization of bias in last layer
