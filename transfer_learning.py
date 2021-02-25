@@ -94,9 +94,12 @@ You will follow the general machine learning workflow.
 import matplotlib.pyplot as plt
 import os
 import tensorflow as tf
-from keras_utils import resumable_fit
+from keras_utils import resumable_fit, Trainer
 from tensorflow.keras.preprocessing import image_dataset_from_directory
 from functools import partial
+from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
+import numpy as np
+
 
 # %%
 """
@@ -123,6 +126,7 @@ validation_dir = os.path.join(PATH, 'validation')
 
 BATCH_SIZE = 32
 IMG_SIZE = (160, 160)
+seed = 42
 
 train_dataset = image_dataset_from_directory(train_dir,
                                              shuffle=True,
@@ -419,17 +423,32 @@ def exp_decaying_lr(epoch, lr, initial, decay, k):
     lr = initial * (decay ** (epoch / k))
     return lr
 
+
 learning_rate_cb = tf.keras.callbacks.LearningRateScheduler(
     partial(exp_decaying_lr, initial=base_learning_rate, decay=.96, k=2.), verbose=1)
 
-history = resumable_fit(model,
+"""history = resumable_fit(model,
                         comp_dir='./comp_state',
                         stem='transfer_learning',
                         compile_cb=compile_cb,
                         x=train_dataset,
                         epochs=initial_epochs,
                         validation_data=validation_dataset,
-                        callbacks=[tensorboard_cb, checkpoint_cb, learning_rate_cb])
+                        callbacks=[tensorboard_cb, checkpoint_cb, learning_rate_cb])"""
+
+hp_space = {'x': train_dataset,
+            'epochs': initial_epochs,
+            'validation_data': validation_dataset,
+            'callbacks': [tensorboard_cb, checkpoint_cb, learning_rate_cb]}
+
+trainer = Trainer(model=model,
+                  compile_cb=compile_cb,
+                  comp_dir='./comp_state',
+                  stem='transfer_learning',
+                  space=hp_space,
+                  log_dir='./logs')
+# Note: if `space` only contains constants, no random variables to sample, then `res` here below will be {}
+res = trainer.do_it(max_evals=3, algo=tpe.suggest, show_progressbar=False, rstate=np.random.RandomState(seed))
 
 # %%
 """
@@ -650,9 +669,9 @@ print('Labels:\n', label_batch)
 plt.figure(figsize=(10, 10))
 for i in range(9):
     ax = plt.subplot(3, 3, i + 1)
-    plt.imshow(image_batch[i].astype("uint8"))
-    plt.title(class_names[predictions[i]])
-    plt.axis("off")
+plt.imshow(image_batch[i].astype("uint8"))
+plt.title(class_names[predictions[i]])
+plt.axis("off")
 pass
 # %%
 """

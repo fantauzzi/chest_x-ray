@@ -1,9 +1,9 @@
-import pickle
-from pathlib import Path
-from functools import reduce, partial
-from copy import deepcopy
-from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
 import tensorflow as tf
+from pathlib import Path
+import pickle
+import shutil
+from copy import deepcopy
+from functools import reduce
 
 
 def keep_last_two_files(file_name):
@@ -12,7 +12,90 @@ def keep_last_two_files(file_name):
     Path(file_name + '.tmp').replace(file_name)
 
 
-class EWA_LearningRateScheduler():
+class CheckpointAndSaveBestModel(tf.keras.callbacks.Callback):
+    def __init__(self,
+                 file_name_stem,
+                 metric_key,
+                 optimization_direction,
+                 patience,
+                 already_computed_epochs,
+                 max_epochs,
+                 best_so_far,
+                 best_epoch,
+                 epoch_history,
+                 history_history):
+        super(CheckpointAndSaveBestModel, self).__init__()
+        assert optimization_direction in ['min', 'max']
+        assert already_computed_epochs < max_epochs
+        self.optimization_direction = optimization_direction
+        self.metric_key = metric_key
+        self.patience = patience
+        self.best_so_far = best_so_far if best_so_far is not None else \
+            float('inf') if optimization_direction == 'min' else float('-inf')
+        self.best_epoch = best_epoch
+        self.model_file_name = None
+        self.file_name_stem = file_name_stem
+        self.max_epochs = max_epochs
+        self.history_epoch = epoch_history
+        self.history_history = history_history
+
+    def on_epoch_end(self, epoch, logs=None):
+        # Save the model at the end of the epoch, to be able to resume training from there
+        tf.keras.models.save_model(model=self.model,
+                                   filepath=self.file_name_stem + '.h5.tmp',
+                                   save_format='h5')
+        keep_last_two_files(self.file_name_stem + '.h5')
+
+        ''' If the last epoch had the best validation so far, then copy the saved model in a dedicated file,
+        that can be loaded and used for testing and inference '''
+        if self.metric_key is not None:
+            metric_value = logs[self.metric_key]
+            if (self.optimization_direction == 'max' and metric_value > self.best_so_far) or \
+                    (self.optimization_direction == 'min' and metric_value < self.best_so_far):
+                self.best_so_far = metric_value
+                self.best_epoch = epoch
+                new_model_file_name = self.file_name_stem + '_best.h5'
+                print(
+                    f'Best epoch so far {self.best_epoch} with {self.optimization_direction} {self.metric_key} = {self.best_so_far} -Saving model in file {new_model_file_name}')
+                shutil.copyfile(self.file_name_stem + '.h5', self.file_name_stem + '_best.h5')
+
+        # Save those variables, needed to resume training from the last epoch, that are not saved with the model
+        for k, v in logs.items():
+            self.history_history.setdefault(k, []).append(v)
+        self.history_epoch = self.history_epoch + [epoch]
+        pickle_this = {'epochs_total': epoch + 1,  # Epochs are numbered from 0
+                       'best_so_far': self.best_so_far,
+                       'best_epoch': self.best_epoch,
+                       'epoch_history': self.history_epoch,
+                       'history_history': self.history_history}
+        pickle_fname = self.file_name_stem + '.pickle'
+        with open(pickle_fname + '.tmp', 'bw') as pickle_f:
+            pickle.dump(pickle_this, pickle_f, protocol=pickle.HIGHEST_PROTOCOL)
+        keep_last_two_files(pickle_fname)
+
+        # Test the conditions to stop training, i.e. the max number of epochs has been exceeded, or early termination
+        if epoch + 1 >= self.max_epochs:  # epochs are numbered from 0
+            print(f'\nStopping training as it has reached the maximum number of epochs {self.max_epochs}')
+            self.model.stop_training = True
+        elif self.best_epoch is not None and self.patience is not None and epoch - self.best_epoch > self.patience:
+            if self.patience == 0:
+                print('\nStopping training has there has been no improvement since the previous epoch.')
+            else:
+                print(f'\nStopping training as there have been no improvements for more than {self.patience} epoch(s).')
+            self.model.stop_training = True
+
+    def on_train_end(self, logs=None):
+        ''' Remove files with intermediate checkpoints of the optimization just completed. Keep only the .h5 file with
+        the best validated model '''
+        # If not required to save the best model, as no evaluation metric was provided, then save the last epoch model
+        if self.metric_key is None:
+            shutil.copyfile(self.file_name_stem + '.h5', self.file_name_stem + '_best.h5')
+        Path(self.file_name_stem + '.h5').unlink(missing_ok=True)
+        Path(self.file_name_stem + '.h5.prev').unlink(missing_ok=True)
+        Path(self.file_name_stem + '.pickle.prev').unlink(missing_ok=True)
+
+
+class LearningRateScheduler():
     def __init__(self, alpha, decay, k):
         self.alpha = alpha
         self.decay = decay
@@ -123,8 +206,7 @@ def resumable_fit(model, comp_dir, stem, compile_cb, **kwargs):
     checkpoint_cb = CheckpointEpoch(comp_dir=comp_dir,
                                     stem=stem,
                                     history=prev_history.history if prev_history is not None else None)
-    callbacks = list(
-        kwargs.get('callbacks', []))  # Workaround for an issue with hyperopt, that turns the list into a tuple
+    callbacks = kwargs.get('callbacks', [])
     callbacks.append(checkpoint_cb)
     kwargs['callbacks'] = callbacks
 
@@ -189,94 +271,102 @@ def resumable_fit(model, comp_dir, stem, compile_cb, **kwargs):
 
 
 class Trainer():
-    def __init__(self, model, compile_cb, comp_dir, stem, space, log_dir = None):
+    def __init__(self, comp_dir, max_evals):
         '''
         An object that implements a callback for hp.tfmin(), and provides it with a state
         '''
-        self.max_evals = None
+        self.max_evals = max_evals
         ''' Try to load the trials object from the file system (to resume an interrupted computation, or recover the 
         result of a completed one); if it fails, then instantiate a new one (start a new computation) '''
-        self.trials_fname = f'{comp_dir}/{stem}_trials.pickle'
-        if Path(self.trials_fname).is_file():
-            with open(self.trials_fname, 'br') as trials_f:
-                self.trials = pickle.load(trials_f)
-        else:
-            self.trials = Trials()
-        self.model = model
-        self.compile_cb = compile_cb
-        self.comp_dir = comp_dir
-        self.stem = stem
-        self.space = space
-        self.trial = None
-        self.log_dir = log_dir
+        self.trials = None
 
-    def make_trial_stem(self, stem, trial):
-        trial_stem = '{}-{:04d}'.format(stem, trial)
-        return trial_stem
-
-    """def on_trial_end(self, result, *args):
-        self.trial += 1
-        self.trial_stem = self.make_trial_stem(self.stem, self.trial)
-        return False, args"""
-
-    def resumable_fit_wrapper(self, params):
-        self.trial += 1
-        trial_stem = self.make_trial_stem(self.stem, self.trial)
-        best_model_for_trial_fname = self.comp_dir + '/' + self.make_trial_stem(self.stem, self.trial) + '_best.h5'
-        ''' If there are Keras callbacks to checkpoint the best model and/or save logs for Tensorboard, set the 
-        respective file names such that they contain the current trial number. This will ensure a different file
-        name for every trial.'''
-        callbacks = params.get('callbacks')
-        if callbacks is not None:
-            for cb in callbacks:
-                if isinstance(cb, tf.keras.callbacks.ModelCheckpoint):
-                    cb.filepath = best_model_for_trial_fname
-                elif isinstance(cb, tf.keras.callbacks.TensorBoard):
-                    assert(self.log_dir is not None)
-                    cb.log_dir = self.log_dir +'/'+trial_stem
-        # TODO above also add the same treatement for the TB logs callback. May need to add an attribute to this class with the log_dir, initialized in the ctor
-        history = resumable_fit(model=self.model,
-                                comp_dir=self.comp_dir,
-                                stem=trial_stem,
-                                compile_cb=self.compile_cb,
-                                **params)
-
-        best_epoch_metric = max(history.history['val_accuracy'])  # TODO this should not be hard-wired, make it configurable along with its optimization direction
-        res = {'status': STATUS_OK,
-               'loss': -best_epoch_metric if best_epoch_metric is not None else None,
-               'history': history.history,
-               'model_file_name': best_model_for_trial_fname}
-
-        return res
-
-    def do_it(self, max_evals, **kwargs):
+    def do_it(**params):
         '''
         The callback to be passed to hp.fmin() as its argument fn
-        :param kwargs: the parameters that the method receives from fmin()
+        :param params: the parameters that the method receives from fmin()
         :return: the return value requested by hp.fmin(), a dictionary with at least to keys 'status' and 'loss'
         '''
-        for k, _ in kwargs.items():
-            assert (k not in ('fn', 'space', 'max_evals', 'trials', 'trials_save_file'))
-        self.trial = -1  # It gets incremented at the beginning of every trial, first trial will be number 0
-        Path(self.comp_dir).mkdir(parents=True, exist_ok=True)
-        if self.log_dir is not None:
-            Path(self.log_dir).mkdir(parents=True, exist_ok=True)
-        self.max_evals = max_evals
-        best = fmin(fn=self.resumable_fit_wrapper,
-                    space=self.space,
-                    max_evals=max_evals,
-                    trials=self.trials,
-                    trials_save_file=self.trials_fname,
-                    **kwargs)
-        return best
-        # algo = tpe.suggest,
-        # show_progressbar=False,
-        # rstate=np.random.RandomState(seed))
+        pass
+
+
+def checkpointed_fit(model,
+                     path_and_fname_stem,
+                     metric_key,
+                     optimization_direction,
+                     patience,
+                     max_epochs,
+                     alpha,
+                     decay,
+                     k,
+                     **args):
+    # These variables will be overwritten if a saved model and pickle file exist
+    already_computed_epochs = 0
+    best_so_far = None
+    best_epoch = None
+    epoch_history = []
+    history_history = {}
+
+    # Load a previously saved model, if it exists, and the corresponding pickled variables
+    pickled_fname = path_and_fname_stem + '.pickle'
+    if Path(pickled_fname).is_file():
+        with open(path_and_fname_stem + '.pickle', 'br') as pickle_f:
+            pickled = pickle.load(pickle_f)
+        # Total number of epochs the model has already been optimized for (>=1)
+        already_computed_epochs = pickled['epochs_total']
+        # Best value of the validation metric during the optimization so far
+        best_so_far = pickled['best_so_far']
+        # Epoch when the best value of the validation metric was obtained (epochs are numbered starting from 0)
+        best_epoch = pickled['best_epoch']
+        epoch_history = pickled['epoch_history']
+        history_history = pickled['history_history']
+
+        # Check if the model has already met the criteria to stop training, and in case do not resume training
+        if (already_computed_epochs >= max_epochs) or (
+                best_epoch is not None and already_computed_epochs - best_epoch > patience):
+            if already_computed_epochs >= max_epochs:
+                print(f'\nThe model has already been trained for the maximum number of epochs {max_epochs}.')
+            elif already_computed_epochs - best_epoch > patience:
+                print(
+                    f'\nModel training already stopped after {already_computed_epochs} epoch(s) because it exceeded {patience} epoch(s) without improvement on metric {metric_key}.')
+            else:
+                assert False
+            history = tf.keras.callbacks.History()
+            history.history = history_history
+            history.model = model
+            return history
+        checkpoint_fname = path_and_fname_stem + '.h5'
+        print(f'\nResuming optimization from the model loaded from {checkpoint_fname}')
+        model = tf.keras.models.load_model(checkpoint_fname)
+
+        print(
+            f'\nResuming training after epoch {already_computed_epochs}. So far the best model validation had {metric_key}={best_so_far} at epoch {best_epoch}.')
+
+    checkpoint_epoch_cb = CheckpointAndSaveBestModel(file_name_stem=path_and_fname_stem,
+                                                     metric_key=metric_key,
+                                                     optimization_direction=optimization_direction,
+                                                     patience=patience,
+                                                     already_computed_epochs=already_computed_epochs,
+                                                     max_epochs=max_epochs,
+                                                     best_so_far=best_so_far,
+                                                     best_epoch=best_epoch,
+                                                     epoch_history=epoch_history,
+                                                     history_history=history_history)
+
+    scheduler = LearningRateScheduler(alpha=alpha, decay=decay, k=k)
+    learning_rate_scheduler_cb = tf.keras.callbacks.LearningRateScheduler(scheduler.update, verbose=1)
+    callbacks = args.get('callbacks', [])
+    callbacks += [checkpoint_epoch_cb, learning_rate_scheduler_cb]
+    args['callbacks'] = callbacks
+    history = model.fit(initial_epoch=already_computed_epochs, **args)
+    history.epoch = checkpoint_epoch_cb.history_epoch
+    history.history = checkpoint_epoch_cb.history_history
+    if history.model is None:
+        history.model = model
+    return history
 
 
 ''' TODO
-Make sure the model is re-compiled, also with the right learning rate and other solver parameters, before every trial
-Try with proper hyperparameters tuning, to be sampled from random variables
+Add resumable tuning of hyperparameters
 
 Add proper initialization of bias in last layer
 Check class balancing

@@ -10,7 +10,7 @@ import pickle
 import random
 from tqdm import tqdm
 from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
-from keras_utils import checkpointed_fit
+from keras_utils_orig import checkpointed_fit
 import shutil
 
 seed = 42
