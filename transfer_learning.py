@@ -94,12 +94,11 @@ You will follow the general machine learning workflow.
 import matplotlib.pyplot as plt
 import os
 import tensorflow as tf
-from keras_utils import resumable_fit, Trainer, EWA_LearningRateScheduler
+from keras_utils import resumable_fit, Trainer, EWA_LearningRateScheduler, load_keras_model, save_keras_model
 from tensorflow.keras.preprocessing import image_dataset_from_directory
 from functools import partial
 from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
 import numpy as np
-
 
 # %%
 """
@@ -359,14 +358,23 @@ Compile the model before training it. Since there are two classes, use a binary 
 base_learning_rate = 0.0001
 
 
-def compile_model(model, **kwargs):
+"""def compile_model(model, **kwargs):
     model.compile(**kwargs)
 
 
-compile_cb = partial(compile_model, optimizer=tf.keras.optimizers.Adam(lr=base_learning_rate),
+compile_cb = partial(compile_model, optimizer=tf.keras.optimizers.Adam(lr=base_learning_rate, name='My_Adam'),
                      loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
-                     metrics=['accuracy'])
-# compile_cb(model)
+                     metrics=['accuracy'])"""
+
+
+
+def compile_cb(model):
+    model.compile(optimizer=tf.keras.optimizers.Adam(lr=base_learning_rate, name='My_Adam'),
+                  loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
+                  metrics=['accuracy'])
+
+
+compile_cb(model)
 """model.compile(optimizer=tf.keras.optimizers.Adam(lr=base_learning_rate),
               loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
               metrics=['accuracy'])"""
@@ -392,13 +400,12 @@ After training for 10 epochs, you should see ~94% accuracy on the validation set
 
 # %%
 initial_epochs = 10
-"""
+
 loss0, accuracy0 = model.evaluate(validation_dataset)
 
 # %%
 print("initial loss: {:.2f}".format(loss0))
 print("initial accuracy: {:.2f}".format(accuracy0))
-"""
 # %%
 
 """history = model.fit(train_dataset,
@@ -445,7 +452,7 @@ hp_space = {'x': train_dataset,
             'k': 2.,
             'callbacks': [tensorboard_cb, checkpoint_cb, learning_rate_cb]}
 
-# 'train_batch_size': hp.choice('train_batch_size', train_batch_sizes),
+# train_batch_size': hp.choice('train_batch_size', train_batch_sizes),
 
 trainer = Trainer(model=model,
                   compile_cb=compile_cb,
@@ -468,7 +475,10 @@ Let's take a look at the learning curves of the training and validation accuracy
 
 # Re-loading the model from disk is a workaround for the spike in training loss at the first epoch of fine-tuning
 # model = tf.keras.models.load_model('./comp_state/transfer_learning_model.h5')
-model = tf.keras.models.load_model('./comp_state/transfer_learning_best.h5')
+# model = tf.keras.models.load_model('./comp_state/transfer_learning_best.h5')
+model, recompile = load_keras_model('./comp_state/transfer_learning_best.h5', compile=False)
+# if compile:
+compile_cb(model)
 base_model = model.layers[4]
 # %%
 acc = history.history['accuracy']

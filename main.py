@@ -502,7 +502,7 @@ def main():
     #    display_by_batch(dataset_train)
 
     def compile_model(model, learning_rate):
-        model.compile(
+        model.recompile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
             loss=tf.keras.losses.BinaryCrossentropy(from_logits=False),
             metrics=[tf.keras.metrics.Precision(name='precision'),

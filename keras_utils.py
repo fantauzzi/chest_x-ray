@@ -46,6 +46,57 @@ def set_trainable_states(layers, names_and_state, idx=0):
     return idx
 
 
+def make_pickle_file_name2(filepath):
+    suffix = Path(filepath).suffix  # The suffix includes the dot, e.g. 'model.h5' => '.h5'
+    assert (suffix != 'pickle')
+    pickle_stem = filepath[:len(filepath) - len(suffix)] if suffix else filepath
+    pickle_fname = pickle_stem + '.pickle'
+    return pickle_fname
+
+
+def make_pickle_file_name(filepath):
+    # Find the last `.h5` or `.tf suffix`, and replace it with `.pickle`
+    suffixes = Path(filepath).suffixes  # Suffixes includes the dot, e.g. 'model.h5' => '.h5'
+    new_suffixes = []
+    found = False
+    for suffix in suffixes[::-1]:
+        if suffix in ('.h5', '.tf') and not found:
+            found = True
+            new_suffixes.append('.pickle')
+        else:
+            new_suffixes.append(suffix)
+    assert (found)
+    prev_suffixes = ''.join(suffixes)
+    new_suffixes = ''.join(new_suffixes[::-1])
+    pickle_filepath = filepath[:len(filepath) - len(prev_suffixes)] + new_suffixes
+    return pickle_filepath
+
+
+def save_keras_model(model, filepath, overwrite=True, include_optimizer=True, save_format=None,
+                     signatures=None, options=None, save_traces=True):
+    pickle_fname = make_pickle_file_name(filepath)
+    trainable = collect_trainable_states(model.layers)
+    tf.keras.models.save_model(model, filepath, overwrite, include_optimizer, save_format, signatures, options,
+                               save_traces)
+    with open(pickle_fname, 'wb') as pickle_f:
+        pickle.dump(trainable, pickle_f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def load_keras_model(filepath, custom_objects=None, compile=True, options=None):
+    pickle_fname = make_pickle_file_name(filepath)
+    model = tf.keras.models.load_model(filepath, custom_objects, compile, options)
+    with open(pickle_fname, 'rb') as pickle_f:
+        trainable = pickle.load(pickle_f)
+    total_trainable = reduce(lambda partial_sum, item: partial_sum + item[1], trainable, 0)
+    if total_trainable < len(trainable):
+        set_trainable_states(model.layers, trainable)
+        trainable_state_changed = True
+    else:
+        trainable_state_changed = False
+
+    return model, trainable_state_changed
+
+
 class CheckpointEpoch(tf.keras.callbacks.Callback):
     def __init__(self, comp_dir, stem, history):
         super(CheckpointEpoch, self).__init__()
@@ -63,14 +114,13 @@ class CheckpointEpoch(tf.keras.callbacks.Callback):
 
     def save_checkpoint(self, epoch, logs):
         # Pickle variables that are needed to restore the computation but are not saved in a .h5 file
-        trainable = collect_trainable_states(self.model.layers)
+        # trainable = collect_trainable_states(self.model.layers)
         updated_history = {}
         for k, v in self.model.history.history.items():
             updated_history[k] = self.history.get(k, []) + self.model.history.history[k]
         pickle_this = {'history': updated_history,
                        'epoch': self.model.history.epoch,
-                       'params': self.model.history.params,
-                       'trainable': trainable}
+                       'params': self.model.history.params}
         if self.model_checkpoint_cb is not None:
             pickle_this['epochs_since_last_save'] = self.model_checkpoint_cb.epochs_since_last_save
             pickle_this['best'] = self.model_checkpoint_cb.best
@@ -78,8 +128,11 @@ class CheckpointEpoch(tf.keras.callbacks.Callback):
             pickle.dump(pickle_this, file=pickle_f, protocol=pickle.HIGHEST_PROTOCOL)
         keep_last_two_files(self.vars_fname)
         # Save the model to be able to resume the computation. Note: save_format='tf' would be much slower
-        tf.keras.models.save_model(self.model, filepath=self.tmp_model_fname, save_format='h5')
+        # tf.keras.models.save_model(self.model, filepath=self.tmp_model_fname, save_format='h5')
+        save_keras_model(self.model, filepath=self.tmp_model_fname, save_format='h5')
         keep_last_two_files(self.model_fname)
+        pickle_filepath = make_pickle_file_name(self.model_fname)
+        keep_last_two_files(pickle_filepath)
 
     def on_train_begin(self, logs=None):
         Path(self.comp_dir).mkdir(parents=True, exist_ok=True)
@@ -94,6 +147,8 @@ class CheckpointEpoch(tf.keras.callbacks.Callback):
         self.save_checkpoint(epoch=len(self.model.history.epoch) + self.epochs_in_history - 1, logs=logs)
         # Remove the .prev files of the computation, not needed anymore
         Path(self.prev_model_fname).unlink(missing_ok=True)
+        pickle_filepath = make_pickle_file_name(self.prev_model_fname)
+        Path(pickle_filepath).unlink(missing_ok=True)
         Path(self.prev_vars_fname).unlink(missing_ok=True)
 
 
@@ -144,8 +199,11 @@ def resumable_fit(model, comp_dir, stem, compile_cb, **kwargs):
             pickled = pickle.load(pickle_f)
         epoch = pickled['epoch']
         next_epoch = epoch[-1] + 1
-        model = tf.keras.models.load_model(model_fname)
-        trainable = pickled['trainable']
+        # model = tf.keras.models.load_model(model_fname)
+        model, recompile = load_keras_model(model_fname, compile=False)
+        # if recompile:
+        compile_cb(model)
+        """trainable = pickled['trainable']
         ''' After the model has been loaded, all its layers are trainable by default. If there is at least one layer
         that should not be trainable (as indicated in `trainable`) then go through every layer of the model and set its 
         `trainable` attribute as needed '''
@@ -155,7 +213,7 @@ def resumable_fit(model, comp_dir, stem, compile_cb, **kwargs):
             sure then that there is a callback to recompile the model '''
             assert (compile_cb is not None)
             set_trainable_states(model.layers, trainable)
-            compile_cb(model)
+            compile_cb(model)"""
         prev_history = tf.keras.callbacks.History()
         prev_history.history = pickled['history']
         prev_history.model = model
@@ -193,6 +251,7 @@ class Trainer():
     def __init__(self, model, compile_cb, comp_dir, stem, space, val_metric, optimization_direction, log_dir=None):
         '''
         An object that implements a callback for hp.tfmin(), and provides it with a state
+        Careful with https://github.com/tensorflow/tensorflow/issues/41021
         '''
         assert (optimization_direction in ('min', 'max'))
         self.max_evals = None
@@ -227,9 +286,13 @@ class Trainer():
         if self.trial == 0:
             self.compile_cb(self.model)
             self.saved_model_fname = f'{self.comp_dir}/{self.stem}_orig.h5'
-            tf.keras.models.save_model(self.model, filepath=self.saved_model_fname, save_format='h5')
+            # tf.keras.models.save_model(self.model, filepath=self.saved_model_fname, save_format='h5')
+            save_keras_model(self.model, filepath=self.saved_model_fname, save_format='h5')
         else:
-            self.model = tf.keras.models.load_model(self.saved_model_fname)
+            # self.model = tf.keras.models.load_model(self.saved_model_fname)
+            self.model, recompile = load_keras_model(self.saved_model_fname, compile=False)
+            # if recompile:
+            self.compile_cb(self.model)
         trial_stem = self.make_trial_stem(self.stem, self.trial)
         best_model_for_trial_fname = self.comp_dir + '/' + self.make_trial_stem(self.stem, self.trial) + '_best.h5'
         ''' If there are Keras callbacks to checkpoint the best model and/or save logs for Tensorboard, set the 
@@ -310,7 +373,11 @@ class Trainer():
 
 
 ''' TODO
-Try with proper hyperparameters tuning, to be sampled from random variables
+THIS FIRST! re-apply freezing of layers, and then compile, when reloading the checkpoint at the beginning of every trial!
+    + move freezing of layers into its own callback. Or make my own function to save/load models inclusive of layers trainable state
+Use the Trainer() during the fine-tuning process
+Add batch size to possible hyper parameters. Move instantiation of pipelines and more useful stuff into callbacks.
+Try fancy/cyclic learning rates
 
 Add proper initialization of bias in last layer
 Check class balancing
