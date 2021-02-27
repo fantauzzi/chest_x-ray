@@ -305,7 +305,7 @@ For details, see the [Transfer learning guide](https://www.tensorflow.org/guide/
 
 # %%
 # Let's take a look at the base model architecture
-base_model.summary()
+# base_model.summary()
 
 # %%
 """
@@ -357,7 +357,6 @@ Compile the model before training it. Since there are two classes, use a binary 
 # %%
 base_learning_rate = 0.0001
 
-
 """def compile_model(model, **kwargs):
     model.compile(**kwargs)
 
@@ -365,7 +364,6 @@ base_learning_rate = 0.0001
 compile_cb = partial(compile_model, optimizer=tf.keras.optimizers.Adam(lr=base_learning_rate, name='My_Adam'),
                      loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
                      metrics=['accuracy'])"""
-
 
 
 def compile_cb(model):
@@ -380,7 +378,7 @@ compile_cb(model)
               metrics=['accuracy'])"""
 
 # %%
-model.summary()
+# model.summary()
 
 # %%
 """
@@ -447,9 +445,10 @@ learning_rate_cb = tf.keras.callbacks.LearningRateScheduler(
 hp_space = {'x': train_dataset,
             'epochs': initial_epochs,
             'validation_data': validation_dataset,
-            'alpha': hp.loguniform('learning_rate', np.log(1e-4), np.log(1e-3)),
-            'decay': .96,
-            'k': 2.,
+            # 'alpha': hp.loguniform('learning_rate', np.log(1e-4), np.log(1e-3)),
+            'alpha': base_learning_rate,
+            'decay': 1,
+            'k': 1,
             'callbacks': [tensorboard_cb, checkpoint_cb, learning_rate_cb]}
 
 # train_batch_size': hp.choice('train_batch_size', train_batch_sizes),
@@ -463,9 +462,20 @@ trainer = Trainer(model=model,
                   optimization_direction='max',
                   log_dir='./logs')
 # Note: if `space` only contains constants, no random variables to sample, then `res` here below will be {}
-res = trainer.do_it(max_evals=3, algo=tpe.suggest, show_progressbar=False, rstate=np.random.RandomState(seed))
-print(res)
-exit(0)
+res = trainer.do_it(max_evals=1, algo=tpe.suggest, show_progressbar=False, rstate=np.random.RandomState(seed))
+
+best_trial = trainer.trials.best_trial
+best_trial_history = best_trial['result']['history']
+best_pretrained = best_trial['result']['model_file_name']
+best_metric_value = max(best_trial_history[trainer.val_metric])
+best_metric_epoch = np.argmax(best_trial_history[trainer.val_metric])
+print(
+    f'Best trained model saved in {best_pretrained} with {trainer.val_metric}={best_metric_value} obtained at epoch {best_metric_epoch}')
+
+print('Best hyper-parameter values:')
+for k, v in res.items():
+    print(k, v)
+
 # %%
 """
 ### Learning curves
@@ -476,16 +486,20 @@ Let's take a look at the learning curves of the training and validation accuracy
 # Re-loading the model from disk is a workaround for the spike in training loss at the first epoch of fine-tuning
 # model = tf.keras.models.load_model('./comp_state/transfer_learning_model.h5')
 # model = tf.keras.models.load_model('./comp_state/transfer_learning_best.h5')
-model, recompile = load_keras_model('./comp_state/transfer_learning_best.h5', compile=False)
+
+# model, recompile = load_keras_model(best_pretrained, compile=False)
+
+
 # if compile:
-compile_cb(model)
+# compile_fine_cb(model)
 base_model = model.layers[4]
 # %%
-acc = history.history['accuracy']
-val_acc = history.history['val_accuracy']
+best_trial_history = trainer.trials.best_trial['result']['history']
+acc = best_trial_history['accuracy']
+val_acc = best_trial_history['val_accuracy']
 
-loss = history.history['loss']
-val_loss = history.history['val_loss']
+loss = best_trial_history['loss']
+val_loss = best_trial_history['val_loss']
 
 plt.figure(figsize=(8, 8))
 plt.subplot(2, 1, 1)
@@ -559,18 +573,27 @@ As you are training a much larger model and want to readapt the pretrained weigh
 """
 
 # %%
-
+"""
 compile_cb_fine = partial(compile_model, loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
                           optimizer=tf.keras.optimizers.RMSprop(lr=base_learning_rate / 10),
-                          metrics=['accuracy'])
-compile_cb_fine(model)
+                          metrics=['accuracy'])"""
+
+model = tf.keras.models.load_model(best_pretrained, compile=False)
+
+
+def compile_fine_cb(model):
+    model.compile(optimizer=tf.keras.optimizers.RMSprop(lr=base_learning_rate/10, name='My_Adam'),
+                  loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
+                  metrics=['accuracy'])
+
+compile_fine_cb(model)
 
 """model.compile(loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
               optimizer=tf.keras.optimizers.RMSprop(lr=base_learning_rate / 10),
               metrics=['accuracy'])"""
 
 # %%
-model.summary()
+# model.summary()
 
 # %%
 len(model.trainable_variables)
@@ -602,15 +625,40 @@ checkpoint_cb_fine = tf.keras.callbacks.ModelCheckpoint(filepath='./comp_state/f
                                                         mode='auto',
                                                         save_freq='epoch')
 
-history_fine = resumable_fit(model=model,
+"""history_fine = resumable_fit(model=model,
                              comp_dir='./comp_state',
                              stem='fine',
-                             compile_cb=compile_cb_fine,
+                             compile_cb=compile_fine_cb,
                              x=train_dataset,
                              epochs=total_epochs,
-                             initial_epoch=history.epoch[-1] + 1,
+                             initial_epoch=initial_epochs,
                              validation_data=validation_dataset,
-                             callbacks=[tensorboard_cb, checkpoint_cb_fine])
+                             callbacks=[tensorboard_cb, checkpoint_cb_fine])"""
+
+tensorboard_fine_cb = tf.keras.callbacks.TensorBoard(log_dir='./logs/fine',
+                                                     histogram_freq=1,
+                                                     profile_batch=(2, 5))
+
+hp_space_fine = {'x': train_dataset,
+                 'epochs': initial_epochs,
+                 'validation_data': validation_dataset,
+                 # 'alpha': hp.loguniform('learning_rate', np.log(1e-4), np.log(1e-3)),
+                 'alpha': base_learning_rate / 10,
+                 'decay': 1,
+                 'k': 1,
+                 'callbacks': [tensorboard_fine_cb, checkpoint_cb_fine, learning_rate_cb]}
+
+trainer_fine = Trainer(model=model,
+                       compile_cb=compile_fine_cb,
+                       comp_dir='./comp_state',
+                       stem='fine',
+                       space=hp_space_fine,
+                       val_metric='val_accuracy',
+                       optimization_direction='max',
+                       log_dir='./logs')
+# Note: if `space` only contains constants, no random variables to sample, then `res` here below will be {}
+res = trainer_fine.do_it(max_evals=1, algo=tpe.suggest, show_progressbar=False, rstate=np.random.RandomState(seed))
+print(res)
 
 # %%
 """
@@ -626,11 +674,24 @@ After fine tuning the model nearly reaches 98% accuracy on the validation set.
 """
 
 # %%
-acc += history_fine.history['accuracy']
-val_acc += history_fine.history['val_accuracy']
+best_trial = trainer_fine.trials.best_trial
+best_trial_history = best_trial['result']['history']
+best_pretrained = best_trial['result']['model_file_name']
+best_metric_value = max(best_trial_history[trainer_fine.val_metric])
+best_metric_epoch = np.argmax(best_trial_history[trainer_fine.val_metric])
+print(
+    f'Best trained model saved in {best_pretrained} with {trainer_fine.val_metric}={best_metric_value} obtained at epoch {best_metric_epoch}')
 
-loss += history_fine.history['loss']
-val_loss += history_fine.history['val_loss']
+print('Best hyper-parameter values:')
+for k, v in res.items():
+    print(k, v)
+
+best_trial_history = trainer_fine.trials.best_trial['result']['history']
+acc += best_trial_history['accuracy']
+val_acc += best_trial_history['val_accuracy']
+
+loss += best_trial_history['loss']
+val_loss += best_trial_history['val_loss']
 
 # %%
 plt.figure(figsize=(8, 8))

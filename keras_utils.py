@@ -373,9 +373,6 @@ class Trainer():
 
 
 ''' TODO
-THIS FIRST! re-apply freezing of layers, and then compile, when reloading the checkpoint at the beginning of every trial!
-    + move freezing of layers into its own callback. Or make my own function to save/load models inclusive of layers trainable state
-Use the Trainer() during the fine-tuning process
 Add batch size to possible hyper parameters. Move instantiation of pipelines and more useful stuff into callbacks.
 Try fancy/cyclic learning rates
 
