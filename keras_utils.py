@@ -39,7 +39,7 @@ def set_trainable_states(layers, names_and_state, idx=0):
     for layer in layers:
         if hasattr(layer, 'trainable'):
             name, layer.trainable = names_and_state[idx]
-            assert (layer.name == name)
+            assert layer.name == name
             idx = idx + 1
         if hasattr(layer, 'layers'):
             idx = set_trainable_states(layer.layers, names_and_state, idx)
@@ -48,7 +48,7 @@ def set_trainable_states(layers, names_and_state, idx=0):
 
 def make_pickle_file_name2(filepath):
     suffix = Path(filepath).suffix  # The suffix includes the dot, e.g. 'model.h5' => '.h5'
-    assert (suffix != 'pickle')
+    assert suffix != 'pickle'
     pickle_stem = filepath[:len(filepath) - len(suffix)] if suffix else filepath
     pickle_fname = pickle_stem + '.pickle'
     return pickle_fname
@@ -65,7 +65,7 @@ def make_pickle_file_name(filepath):
             new_suffixes.append('.pickle')
         else:
             new_suffixes.append(suffix)
-    assert (found)
+    assert found
     prev_suffixes = ''.join(suffixes)
     new_suffixes = ''.join(new_suffixes[::-1])
     pickle_filepath = filepath[:len(filepath) - len(prev_suffixes)] + new_suffixes
@@ -211,7 +211,7 @@ def resumable_fit(model, comp_dir, stem, compile_cb, **kwargs):
         if total_trainable < len(trainable):
             ''' If any layer is set to not trainable, then the model must be compiled again, to apply the changes; make
             sure then that there is a callback to recompile the model '''
-            assert (compile_cb is not None)
+            assert compile_cb is not None
             set_trainable_states(model.layers, trainable)
             compile_cb(model)"""
         prev_history = tf.keras.callbacks.History()
@@ -248,12 +248,13 @@ def resumable_fit(model, comp_dir, stem, compile_cb, **kwargs):
 
 
 class Trainer():
-    def __init__(self, model, compile_cb, comp_dir, stem, space, val_metric, optimization_direction, log_dir=None):
+    def __init__(self, model, compile_cb, comp_dir, stem, space, val_metric, optimization_direction, log_dir=None,
+                 make_train_dataset_cb=None):
         '''
         An object that implements a callback for hp.tfmin(), and provides it with a state
         Careful with https://github.com/tensorflow/tensorflow/issues/41021
         '''
-        assert (optimization_direction in ('min', 'max'))
+        assert optimization_direction in ('min', 'max')
         self.max_evals = None
         ''' Try to load the trials object from the file system (to resume an interrupted computation, or recover the 
         result of a completed one); if it fails, then instantiate a new one (start a new computation) '''
@@ -273,6 +274,7 @@ class Trainer():
         self.log_dir = log_dir
         self.val_metric = val_metric
         self.optimization_direction = optimization_direction
+        self.make_train_dataset_cb = make_train_dataset_cb
 
     def make_trial_stem(self, stem, trial):
         trial_stem = '{}-{:04d}'.format(stem, trial)
@@ -323,6 +325,12 @@ class Trainer():
                     if k is not None:
                         del params['k']
                         cb.k = k
+        if self.make_train_dataset_cb is not None:
+            x, params = self.make_train_dataset_cb(**params)
+            if x is not None:
+                assert params.get('x') is None
+                params['x'] = x
+
 
         history = resumable_fit(model=self.model,
                                 comp_dir=self.comp_dir,
@@ -357,7 +365,7 @@ class Trainer():
         :return: the return value of hyperopt.fmin(), a dictionary with at least two keys 'status' and 'loss'.
         '''
         for k, _ in kwargs.items():
-            assert (k not in ('fn', 'space', 'max_evals', 'trials', 'trials_save_file'))
+            assert k not in ('fn', 'space', 'max_evals', 'trials', 'trials_save_file')
         self.trial = -1  # It gets incremented at the beginning of every trial, first trial will be number 0
         Path(self.comp_dir).mkdir(parents=True, exist_ok=True)
         if self.log_dir is not None:
@@ -373,7 +381,6 @@ class Trainer():
 
 
 ''' TODO
-Add batch size to possible hyper parameters. Move instantiation of pipelines and more useful stuff into callbacks.
 Try fancy/cyclic learning rates
 
 Add proper initialization of bias in last layer
