@@ -142,6 +142,7 @@ cython_debug/
 logs
 models
 computation_states
+comp_state
 *.prev
 *.pickle
 

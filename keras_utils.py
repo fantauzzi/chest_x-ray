@@ -1,9 +1,12 @@
 import pickle
+import logging
 from pathlib import Path
 from functools import reduce, partial
 from copy import deepcopy
 from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
 import tensorflow as tf
+import numpy as np
+import pandas as pd
 
 
 def keep_last_two_files(file_name):
@@ -249,12 +252,22 @@ def resumable_fit(model, comp_dir, stem, compile_cb, **kwargs):
 
 class Trainer():
     def __init__(self, model, compile_cb, comp_dir, stem, space, val_metric, optimization_direction, log_dir=None,
-                 make_train_dataset_cb=None):
+                 make_train_dataset_cb=None, log_level=logging.INFO):
         '''
         An object that implements a callback for hp.tfmin(), and provides it with a state
         Careful with https://github.com/tensorflow/tensorflow/issues/41021
         '''
         assert optimization_direction in ('min', 'max')
+
+        self.logger = logging.getLogger('Trainer')
+        self.logger.handlers = []
+        self.logger.setLevel(logging.INFO)
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(asctime)s - %(name)s: %(levelname)s %(message)s')
+        ch.setFormatter(formatter)
+        self.logger.addHandler(ch)
+
         self.max_evals = None
         ''' Try to load the trials object from the file system (to resume an interrupted computation, or recover the 
         result of a completed one); if it fails, then instantiate a new one (start a new computation) '''
@@ -275,6 +288,8 @@ class Trainer():
         self.val_metric = val_metric
         self.optimization_direction = optimization_direction
         self.make_train_dataset_cb = make_train_dataset_cb
+        self.report_file = f'{comp_dir}/{stem}.csv'
+        self.report = None
 
     def make_trial_stem(self, stem, trial):
         trial_stem = '{}-{:04d}'.format(stem, trial)
@@ -286,14 +301,14 @@ class Trainer():
         reload the checkpointed model from disk, to ensure every run of the optimization process starts from the same
         model and in the same state '''
         if self.trial == 0:
+            self.logger.info(
+                f'Starting trial 0, saving model {self.model.name} at beginning of trial in file {self.saved_model_fname}')
             self.compile_cb(self.model)
             self.saved_model_fname = f'{self.comp_dir}/{self.stem}_orig.h5'
-            # tf.keras.models.save_model(self.model, filepath=self.saved_model_fname, save_format='h5')
             save_keras_model(self.model, filepath=self.saved_model_fname, save_format='h5')
         else:
-            # self.model = tf.keras.models.load_model(self.saved_model_fname)
+            self.logger.info(f'Starting trial {self.trial}, reloading model from {self.saved_model_fname}')
             self.model, recompile = load_keras_model(self.saved_model_fname, compile=False)
-            # if recompile:
             self.compile_cb(self.model)
         trial_stem = self.make_trial_stem(self.stem, self.trial)
         best_model_for_trial_fname = self.comp_dir + '/' + self.make_trial_stem(self.stem, self.trial) + '_best.h5'
@@ -331,7 +346,6 @@ class Trainer():
                 assert params.get('x') is None
                 params['x'] = x
 
-
         history = resumable_fit(model=self.model,
                                 comp_dir=self.comp_dir,
                                 stem=trial_stem,
@@ -341,17 +355,41 @@ class Trainer():
         ''' If this was the last trial, remove the file with the model checkpointed at the beginning of the first trial,
         it is not needed anymore '''
         if self.trial == self.max_evals - 1:
+            self.logger.info(f'Last trial completed, removing temporary file {self.saved_model_fname}')
             Path(self.saved_model_fname).unlink(missing_ok=True)
             self.saved_model_fname = None
 
         loss = -max(history.history[self.val_metric]) if self.optimization_direction == 'max' \
             else min(history.history[self.val_metric])
 
+        best_epoch = np.argmin(history.history[self.val_metric]) if self.optimization_direction == 'min' \
+            else np.argmax(history.history[self.val_metric])
+        record = {'trial': self.trial,
+                  'best epoch': best_epoch,
+                  'hyperopt loss': loss}
+        for k, v in history.history.items():
+            record[k] = v[best_epoch]
+
+        record['file name'] = best_model_for_trial_fname
+
+        for k, v in self.trials.trials[-1]['misc']['vals'].items():
+            record[k] = v[0]
+        if Path(self.report_file).is_file():
+            self.report = pd.read_csv(self.report_file)
+            self.report = self.report.append(pd.Series(record), ignore_index=True)
+        else:
+            self.report = pd.DataFrame.from_records([record])
+        self.report.to_csv(self.report_file + '.tmp')
+        keep_last_two_files(self.report_file)
+
         res = {'status': STATUS_OK,
                'loss': loss,
                'history': history.history,
                'model_file_name': best_model_for_trial_fname,
                'trial': self.trial}
+
+        self.logger.info(
+            f'Trial {self.trial} completed. Best model saved in {best_model_for_trial_fname} with hyperopt loss {loss}.')
 
         return res
 
@@ -364,6 +402,7 @@ class Trainer():
         fn, space, max_evals, trials, trials_save_file.
         :return: the return value of hyperopt.fmin(), a dictionary with at least two keys 'status' and 'loss'.
         '''
+        self.logger.info(f'Requested to run {max_evals} trials, with trials state saved in {self.trials_fname}')
         for k, _ in kwargs.items():
             assert k not in ('fn', 'space', 'max_evals', 'trials', 'trials_save_file')
         self.trial = -1  # It gets incremented at the beginning of every trial, first trial will be number 0
@@ -377,10 +416,16 @@ class Trainer():
                     trials=self.trials,
                     trials_save_file=self.trials_fname,
                     **kwargs)
+        self.logger.info(
+            f"Completed {len(self.trials.tids)} trials on model {self.model.name}")
+        self.logger.info(
+            f"Best trial was no. {self.trials.best_trial['tid']} with hyperopt loss {self.trials.best_trial['result']['loss']} - Trained model in {self.trials.best_trial['result']['model_file_name']}")
         return best
 
 
 ''' TODO
+Clean up and complete the csv report
+Integrate with the X-ray classification
 Try fancy/cyclic learning rates
 
 Add proper initialization of bias in last layer

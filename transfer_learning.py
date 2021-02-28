@@ -39,13 +39,25 @@
 # FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
-import matplotlib.pyplot as plt
 import os
+from logging import info
+import logging
+import matplotlib.pyplot as plt
 import tensorflow as tf
 from keras_utils import resumable_fit, Trainer, EWA_LearningRateScheduler, load_keras_model, save_keras_model
 from tensorflow.keras.preprocessing import image_dataset_from_directory
-from hyperopt import tpe, hp
 import numpy as np
+from hyperopt import tpe, hp
+
+"""logger = logging.getLogger('Trainer')
+logger.setLevel(logging.INFO)
+ch = logging.StreamHandler()
+ch.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(name)s: %(levelname)s %(message)s')
+ch.setFormatter(formatter)
+logger.addHandler(ch)
+
+logger.info('Starting experiments 1')"""
 
 """
 In this tutorial, you will use a dataset containing several thousand images of cats and dogs. Download and extract a 
@@ -268,6 +280,7 @@ inputs = tf.keras.Input(shape=(160, 160, 3))
 x = data_augmentation(inputs)
 x = preprocess_input(x)
 x = base_model(x, training=False)
+# x = base_model(x)
 x = global_average_layer(x)
 x = tf.keras.layers.Dropout(0.2)(x)
 outputs = prediction_layer(x)
@@ -283,7 +296,7 @@ base_learning_rate = 0.0001
 
 
 def compile_cb(model):
-    model.compile(optimizer=tf.keras.optimizers.Adam(lr=base_learning_rate, name='My_Adam'),
+    model.compile(optimizer=tf.keras.optimizers.Adam(lr=base_learning_rate),
                   loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
                   metrics=['accuracy'])
 
@@ -331,11 +344,19 @@ hp_space = {  # 'x': train_dataset,
     'validation_data': validation_dataset,
     # 'alpha': hp.loguniform('learning_rate', np.log(1e-4), np.log(1e-3)),
     'alpha': base_learning_rate,
-    'decay': 1,
-    'k': 1,
+    'decay': .97,
+    'k': hp.uniform('k', 1., 5.),
     'callbacks': [tensorboard_cb, checkpoint_cb, learning_rate_cb]}
-
 # train_batch_size': hp.choice('train_batch_size', train_batch_sizes),
+
+"""hp_space = {'epochs': initial_epochs,
+            'batch_size': BATCH_SIZE,
+            'validation_data': validation_dataset,
+            # 'alpha': hp.loguniform('learning_rate', np.log(1e-4), np.log(1e-3)),
+            'alpha': base_learning_rate,
+            'decay': .97,
+            'k': 2.,
+            'callbacks': [tensorboard_cb, checkpoint_cb, learning_rate_cb]}"""
 
 trainer = Trainer(model=model,
                   compile_cb=compile_cb,
@@ -347,7 +368,7 @@ trainer = Trainer(model=model,
                   log_dir='./logs',
                   make_train_dataset_cb=make_train_dataset_cb)
 # Note: if `space` only contains constants, no random variables to sample, then `res` here below will be {}
-res = trainer.do_it(max_evals=1, algo=tpe.suggest, show_progressbar=False, rstate=np.random.RandomState(seed))
+res = trainer.do_it(max_evals=3, algo=tpe.suggest, show_progressbar=False, rstate=np.random.RandomState(seed))
 
 best_trial = trainer.trials.best_trial
 best_trial_history = best_trial['result']['history']
@@ -375,14 +396,13 @@ model as a fixed feature extractor.
 
 # if compile:
 # compile_fine_cb(model)
-base_model = model.layers[4]
 best_trial_history = trainer.trials.best_trial['result']['history']
 acc = best_trial_history['accuracy']
 val_acc = best_trial_history['val_accuracy']
 
 loss = best_trial_history['loss']
 val_loss = best_trial_history['val_loss']
-
+"""
 plt.figure(figsize=(8, 8))
 plt.subplot(2, 1, 1)
 plt.plot(acc, label='Training Accuracy')
@@ -401,6 +421,7 @@ plt.ylim([0, 1.0])
 plt.title('Training and Validation Loss')
 plt.xlabel('epoch')
 plt.show()
+"""
 
 """
 Note: If you are wondering why the validation metrics are clearly better than the training metrics, the main factor 
@@ -437,7 +458,8 @@ features to work with the new dataset, rather than overwrite the generic learnin
 All you need to do is unfreeze the `base_model` and set the bottom layers to be un-trainable. Then, you should 
 recompile the model (necessary for these changes to take effect), and resume training.
 """
-
+model = tf.keras.models.load_model(best_pretrained, compile=False)
+base_model = model.layers[4]
 base_model.trainable = True
 
 # Let's take a look to see how many layers are in the base model
@@ -456,11 +478,11 @@ As you are training a much larger model and want to readapt the pretrained weigh
 learning rate at this stage. Otherwise, your model could overfit very quickly.
 """
 
-model = tf.keras.models.load_model(best_pretrained, compile=False)
+
 
 
 def compile_fine_cb(model):
-    model.compile(optimizer=tf.keras.optimizers.RMSprop(lr=base_learning_rate / 10, name='My_Adam'),
+    model.compile(optimizer=tf.keras.optimizers.RMSprop(lr=base_learning_rate / 10),
                   loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
                   metrics=['accuracy'])
 
@@ -474,7 +496,7 @@ len(model.trainable_variables)
 If you trained to convergence earlier, this step will improve your accuracy by a few percentage points.
 """
 
-fine_tune_epochs = 10
+fine_tune_epochs = 20
 total_epochs = initial_epochs + fine_tune_epochs
 
 checkpoint_cb_fine = tf.keras.callbacks.ModelCheckpoint(filepath='./comp_state/fine_best.h5',
@@ -504,7 +526,7 @@ tensorboard_fine_cb = tf.keras.callbacks.TensorBoard(log_dir='./logs/fine',
 # train_dataset, _ = make_train_dataset_cb(batch_size=BATCH_SIZE)
 
 hp_space_fine = {  # 'x': train_dataset,
-    'epochs': initial_epochs,
+    'epochs': fine_tune_epochs,
     'batch_size': hp.choice('train_batch_size', train_batch_sizes),
     'validation_data': validation_dataset,
     # 'alpha': hp.loguniform('learning_rate', np.log(1e-4), np.log(1e-3)),
@@ -512,6 +534,16 @@ hp_space_fine = {  # 'x': train_dataset,
     'decay': .97,
     'k': hp.uniform('k', 1., 5.),
     'callbacks': [tensorboard_fine_cb, checkpoint_cb_fine, learning_rate_cb]}
+
+"""hp_space_fine = {  # 'x': train_dataset,
+    'epochs': fine_tune_epochs,
+    'batch_size': BATCH_SIZE,
+    'validation_data': validation_dataset,
+    # 'alpha': hp.loguniform('learning_rate', np.log(1e-4), np.log(1e-3)),
+    'alpha': base_learning_rate / 10,
+    'decay': .97,
+    'k': 2,
+    'callbacks': [tensorboard_fine_cb, checkpoint_cb_fine, learning_rate_cb]}"""
 
 trainer_fine = Trainer(model=model,
                        compile_cb=compile_fine_cb,
@@ -523,7 +555,8 @@ trainer_fine = Trainer(model=model,
                        log_dir='./logs',
                        make_train_dataset_cb=make_train_dataset_cb)
 # Note: if `space` only contains constants, no random variables to sample, then `res` here below will be {}
-res = trainer_fine.do_it(max_evals=10, algo=tpe.suggest, show_progressbar=False, rstate=np.random.RandomState(seed))
+# logger.info('Starting experiments 2')
+res = trainer_fine.do_it(max_evals=20, algo=tpe.suggest, show_progressbar=False, rstate=np.random.RandomState(seed))
 print(res)
 
 """
