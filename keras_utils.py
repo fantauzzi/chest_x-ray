@@ -1,11 +1,11 @@
 import pickle
 import logging
 from pathlib import Path
-from functools import reduce, partial
+from functools import reduce
 from copy import deepcopy
 from time import time
 from datetime import timedelta
-from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
+from hyperopt import fmin, STATUS_OK, Trials
 import tensorflow as tf
 import numpy as np
 import pandas as pd
@@ -51,12 +51,20 @@ def set_trainable_states(layers, names_and_state, idx=0):
     return idx
 
 
-def make_pickle_file_name2(filepath):
-    suffix = Path(filepath).suffix  # The suffix includes the dot, e.g. 'model.h5' => '.h5'
-    assert suffix != 'pickle'
-    pickle_stem = filepath[:len(filepath) - len(suffix)] if suffix else filepath
-    pickle_fname = pickle_stem + '.pickle'
-    return pickle_fname
+def count_components(variables):
+    res = sum([np.prod(variable.shape) for variable in variables])
+    return res
+
+
+def count_weights(layer_or_model):
+    trainables_weights, non_trainable_weights, total_weights = 0, 0, 0
+    if hasattr(layer_or_model, 'trainable_weights'):
+        trainables_weights += count_components(layer_or_model.trainable_weights)
+    if hasattr(layer_or_model, 'non_trainable_weights'):
+        non_trainable_weights += count_components(layer_or_model.non_trainable_weights)
+    if hasattr(layer_or_model, 'weights'):
+        total_weights += count_components(layer_or_model.weights)
+    return trainables_weights, non_trainable_weights, total_weights
 
 
 def make_pickle_file_name(filepath):
@@ -426,6 +434,7 @@ class Trainer():
                     **kwargs)
         end_time = time()
 
+        tr, nt, tot = count_weights(self.model)
         report = {'Running time (h:mm:s)': timedelta(seconds=end_time - start_time),
                   'Running time (min)': (end_time - start_time) / 60,
                   'Trials': len(self.trials.results),
@@ -438,11 +447,17 @@ class Trainer():
                   'Log dir.': self.log_dir,
                   'Stem': self.stem,
                   'Model name': self.model.name,
+                  'Trainable parameters': tr,
+                  'Non-trainable parameters': nt,
+                  'Total parameters': tot,
                   'Evaluation metric': self.val_metric,
                   'Optimization direction': self.optimization_direction}
 
-        pd.Series(report).to_csv(self.summary_report_file, index=True)
-        self.logger.info("Trials completed")
+        if Path(self.summary_report_file).is_file():
+            self.logger.info(f'Summary file {self.summary_report_file} exists already, not overwriting it')
+        else:
+            pd.Series(report).to_csv(self.summary_report_file, index=True)
+        self.logger.info("All trials completed")
         for k, v in report.items():
             self.logger.info(f'   {k}: {v}')
 
@@ -451,7 +466,6 @@ class Trainer():
 
 
 ''' TODO
-Clean up and complete the csv report
 Integrate with the X-ray classification
 Try fancy/cyclic learning rates
 
