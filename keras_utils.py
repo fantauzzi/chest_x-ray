@@ -3,6 +3,8 @@ import logging
 from pathlib import Path
 from functools import reduce, partial
 from copy import deepcopy
+from time import time
+from datetime import timedelta
 from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
 import tensorflow as tf
 import numpy as np
@@ -290,6 +292,7 @@ class Trainer():
         self.make_train_dataset_cb = make_train_dataset_cb
         self.report_file = f'{comp_dir}/{stem}.csv'
         self.report = None
+        self.summary_report_file = f'{self.comp_dir}/{self.stem}_summary.csv'
 
     def make_trial_stem(self, stem, trial):
         trial_stem = '{}-{:04d}'.format(stem, trial)
@@ -346,11 +349,13 @@ class Trainer():
                 assert params.get('x') is None
                 params['x'] = x
 
+        start_time = time()
         history = resumable_fit(model=self.model,
                                 comp_dir=self.comp_dir,
                                 stem=trial_stem,
                                 compile_cb=self.compile_cb,
                                 **params)
+        end_time = time()
 
         ''' If this was the last trial, remove the file with the model checkpointed at the beginning of the first trial,
         it is not needed anymore '''
@@ -365,6 +370,8 @@ class Trainer():
         best_epoch = np.argmin(history.history[self.val_metric]) if self.optimization_direction == 'min' \
             else np.argmax(history.history[self.val_metric])
         record = {'trial': self.trial,
+                  'running time (sec)': end_time - start_time,
+                  'epochs run': len(history.epoch),
                   'best epoch': best_epoch,
                   'hyperopt loss': loss}
         for k, v in history.history.items():
@@ -379,7 +386,7 @@ class Trainer():
             self.report = self.report.append(pd.Series(record), ignore_index=True)
         else:
             self.report = pd.DataFrame.from_records([record])
-        self.report.to_csv(self.report_file + '.tmp')
+        self.report.to_csv(self.report_file + '.tmp', index=False)
         keep_last_two_files(self.report_file)
 
         res = {'status': STATUS_OK,
@@ -410,16 +417,36 @@ class Trainer():
         if self.log_dir is not None:
             Path(self.log_dir).mkdir(parents=True, exist_ok=True)
         self.max_evals = max_evals
+        start_time = time()
         best = fmin(fn=self.resumable_fit_wrapper,
                     space=self.space,
                     max_evals=max_evals,
                     trials=self.trials,
                     trials_save_file=self.trials_fname,
                     **kwargs)
-        self.logger.info(
-            f"Completed {len(self.trials.tids)} trials on model {self.model.name}")
-        self.logger.info(
-            f"Best trial was no. {self.trials.best_trial['tid']} with hyperopt loss {self.trials.best_trial['result']['loss']} - Trained model in {self.trials.best_trial['result']['model_file_name']}")
+        end_time = time()
+
+        report = {'Running time (h:mm:s)': timedelta(seconds=end_time - start_time),
+                  'Running time (min)': (end_time - start_time) / 60,
+                  'Trials': len(self.trials.results),
+                  'Best trial': self.trials.best_trial['tid'],
+                  'Best trial hyperopt loss': self.trials.best_trial['result']['loss'],
+                  'Best model saved in': self.trials.best_trial['result']['model_file_name'],
+                  'Trials report file': self.report_file,
+                  'Summary report': self.summary_report_file,
+                  'Computation dir.': self.comp_dir,
+                  'Log dir.': self.log_dir,
+                  'Stem': self.stem,
+                  'Model name': self.model.name,
+                  'Evaluation metric': self.val_metric,
+                  'Optimization direction': self.optimization_direction}
+
+        pd.Series(report).to_csv(self.summary_report_file, index=True)
+        self.logger.info("Trials completed")
+        for k, v in report.items():
+            self.logger.info(f'   {k}: {v}')
+
+        Path(self.report_file + '.prev').unlink(missing_ok=True)
         return best
 
 

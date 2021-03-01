@@ -496,7 +496,7 @@ len(model.trainable_variables)
 If you trained to convergence earlier, this step will improve your accuracy by a few percentage points.
 """
 
-fine_tune_epochs = 20
+fine_tune_epochs = 10
 total_epochs = initial_epochs + fine_tune_epochs
 
 checkpoint_cb_fine = tf.keras.callbacks.ModelCheckpoint(filepath='./comp_state/fine_best.h5',
@@ -556,7 +556,7 @@ trainer_fine = Trainer(model=model,
                        make_train_dataset_cb=make_train_dataset_cb)
 # Note: if `space` only contains constants, no random variables to sample, then `res` here below will be {}
 # logger.info('Starting experiments 2')
-res = trainer_fine.do_it(max_evals=20, algo=tpe.suggest, show_progressbar=False, rstate=np.random.RandomState(seed))
+res = trainer_fine.do_it(max_evals=4, algo=tpe.suggest, show_progressbar=False, rstate=np.random.RandomState(seed))
 print(res)
 
 """
