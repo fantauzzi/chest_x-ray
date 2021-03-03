@@ -168,7 +168,8 @@ def make_k_fold_file_name(stem):
     return fname
 
 
-def k_fold_resumable_fit(model, comp_dir, stem, compile_cb, make_datasets_cb, n_folds, **kwargs):
+def k_fold_resumable_fit(model, comp_dir, stem, compile_cb, make_datasets_cb, n_folds, log_level=logging.INFO,
+                         **kwargs):
     """
 
     :param model:
@@ -186,6 +187,8 @@ def k_fold_resumable_fit(model, comp_dir, stem, compile_cb, make_datasets_cb, n_
     assert kwargs.get('x') is None
     assert kwargs.get('validation_data') is None
 
+    logger = make_logger(name='k_fold_resumable_fit', log_level=log_level)
+
     state_file_path = make_k_fold_file_name(f'{comp_dir}/{stem}')
     current_fold = 0
     histories = []
@@ -196,12 +199,17 @@ def k_fold_resumable_fit(model, comp_dir, stem, compile_cb, make_datasets_cb, n_
             pickled = pickle.load(pickle_f)
         current_fold = pickled['fold'] + 1
         histories = pickled['histories']
+        logger.info(
+            f"Reloaded the state of previous k-fold cross validation from {state_file_path} - {pickled['fold']} folds already computed")
+    else:
+        logger.info(f"State of k-fold cross validation will be saved in {state_file_path}")
 
     for fold in range(current_fold, n_folds):
         train_ds, val_ds = make_datasets_cb(fold, n_folds, **kwargs)
         kwargs['x'] = train_ds
         kwargs['validation_data'] = val_ds
         fold_stem = '{}-fold{:02d}'.format(stem, fold)
+        logger.info(f'Processing fold {fold} - Total folds to be processed: {n_folds}')
         history = resumable_fit(model=model, comp_dir=comp_dir, stem=fold_stem, compile_cb=compile_cb, **kwargs)
         histories.append(history.history)
         # Update the state of the k-fold x-validation as saved in the pickle
@@ -210,6 +218,7 @@ def k_fold_resumable_fit(model, comp_dir, stem, compile_cb, make_datasets_cb, n_
             pickle.dump(obj=pickle_this, file=pickle_f, protocol=pickle.HIGHEST_PROTOCOL)
             keep_last_two_files(state_file_path)
 
+    logger.info(f"All {n_folds} folds of the cross-validation have been processed")
     return histories
 
 
@@ -296,6 +305,18 @@ def resumable_fit(model, comp_dir, stem, compile_cb, **kwargs):
     return history
 
 
+def make_logger(name, log_level):
+    logger = logging.getLogger(name)
+    logger.handlers = []
+    logger.setLevel(log_level)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(name)s: %(levelname)s %(message)s')
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+    return logger
+
+
 class Trainer():
     def __init__(self, model, compile_cb, comp_dir, stem, space, val_metric, optimization_direction, log_dir=None,
                  make_train_dataset_cb=None, log_level=logging.INFO):
@@ -305,14 +326,15 @@ class Trainer():
         '''
         assert optimization_direction in ('min', 'max')
 
-        self.logger = logging.getLogger('Trainer')
+        """self.logger = logging.getLogger('Trainer')
         self.logger.handlers = []
-        self.logger.setLevel(logging.INFO)
+        self.logger.setLevel(log_level)
         ch = logging.StreamHandler()
         ch.setLevel(logging.INFO)
         formatter = logging.Formatter('%(asctime)s - %(name)s: %(levelname)s %(message)s')
         ch.setFormatter(formatter)
-        self.logger.addHandler(ch)
+        self.logger.addHandler(ch)"""
+        self.logger = make_logger(name='Trainer', log_level=log_level)
 
         self.max_evals = None
         ''' Try to load the trials object from the file system (to resume an interrupted computation, or recover the 
@@ -502,8 +524,10 @@ class Trainer():
 
 
 ''' TODO
-Integrate datasets for k-fold (experiments2.py) in the k-fold x-validation 
 Check that re-using callbacks between folds and/or trials doesn't mess them up
+re-train the final model and test it
+correct log dir for k-fold x-validation
+charts and statistics for k-fold x-validation, choice of the final model for inference (and test)
 Integrate with the X-ray classification
 Document properly
 Try fancy/cyclic learning rates

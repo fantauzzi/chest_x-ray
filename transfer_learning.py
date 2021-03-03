@@ -583,32 +583,30 @@ val_acc += best_trial_history['val_accuracy']
 loss += best_trial_history['loss']
 val_loss += best_trial_history['val_loss']
 
-
-
 model = tf.keras.models.load_model(best_pretrained)
 compile_cb(model)
 
 
-
 def make_datasets_cb(fold, n_folds, **kwargs):
     dataset1 = image_dataset_from_directory(train_dir,
-                                                 shuffle=True,
-                                                 batch_size=64,
-                                                 image_size=IMG_SIZE)
+                                            shuffle=True,
+                                            batch_size=BATCH_SIZE,
+                                            image_size=IMG_SIZE)
     dataset1_size = len(list(Path(train_dir).glob('**/*.jpg')))
 
     dataset2 = image_dataset_from_directory(validation_dir,
                                             shuffle=True,
-                                            batch_size=64,
+                                            batch_size=BATCH_SIZE,
                                             image_size=IMG_SIZE)
     dataset2_size = len(list(Path(validation_dir).glob('**/*.jpg')))
-    dataset_size = dataset1_size + dataset2_size
+    dataset2 = dataset2.skip(dataset2_size // 5)  # Skip the part of the validation dataset that is used for testing
+
+    dataset_size = dataset1_size + dataset2_size - dataset2_size // 5
 
     dataset = dataset1.concatenate(dataset2)
     dataset = dataset.unbatch()
     dataset = dataset.cache()
-    dataset = dataset.shuffle( dataset_size, seed=42, reshuffle_each_iteration=False)
-
+    dataset = dataset.shuffle(dataset_size, seed=42, reshuffle_each_iteration=False)
 
     fold_size = (dataset_size) // n_folds
     batch_size = kwargs['batch_size']
@@ -634,7 +632,7 @@ tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir='./logs/kfold',
                                                 histogram_freq=1,
                                                 profile_batch=(2, 5))
 
-learning_rate_cb = EWA_LearningRateScheduler(alpha = base_learning_rate/10, decay=.97, k=3.906134626287861)
+learning_rate_cb = EWA_LearningRateScheduler(alpha=base_learning_rate / 10, decay=.97, k=3.906134626287861)
 histories = k_fold_resumable_fit(model=model,
                                  comp_dir='./kfold_compstate',
                                  stem='transfer_learning',
