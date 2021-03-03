@@ -127,7 +127,6 @@ class CheckpointEpoch(tf.keras.callbacks.Callback):
 
     def save_checkpoint(self, epoch, logs):
         # Pickle variables that are needed to restore the computation but are not saved in a .h5 file
-        # trainable = collect_trainable_states(self.model.layers)
         updated_history = {}
         for k, v in self.model.history.history.items():
             updated_history[k] = self.history.get(k, []) + self.model.history.history[k]
@@ -141,7 +140,6 @@ class CheckpointEpoch(tf.keras.callbacks.Callback):
             pickle.dump(pickle_this, file=pickle_f, protocol=pickle.HIGHEST_PROTOCOL)
         keep_last_two_files(self.vars_fname)
         # Save the model to be able to resume the computation. Note: save_format='tf' would be much slower
-        # tf.keras.models.save_model(self.model, filepath=self.tmp_model_fname, save_format='h5')
         save_keras_model(self.model, filepath=self.tmp_model_fname, save_format='h5')
         keep_last_two_files(self.model_fname)
         pickle_filepath = make_pickle_file_name(self.model_fname)
@@ -163,6 +161,56 @@ class CheckpointEpoch(tf.keras.callbacks.Callback):
         pickle_filepath = make_pickle_file_name(self.prev_model_fname)
         Path(pickle_filepath).unlink(missing_ok=True)
         Path(self.prev_vars_fname).unlink(missing_ok=True)
+
+
+def make_k_fold_file_name(stem):
+    fname = stem + '_kfold.pickle'
+    return fname
+
+
+def k_fold_resumable_fit(model, comp_dir, stem, compile_cb, make_datasets_cb, n_folds, **kwargs):
+    """
+
+    :param model:
+    :param comp_dir:
+    :param stem:
+    :param compile_cb:
+    :param make_datasets_cb: a function or method that instantiates the training and, optionally, validation pipelines.
+    It takes three parameters: the fold number, a non-negative integer, the total number of folds, a positive
+    integer, and **kwargs. It returns two instances of td.data.Dataset, with the training and validation datasets
+    respectively for the given fold number, or one instance and None, if no validation is required.
+    :param n_folds:
+    :param kwargs:
+    :return:
+    """
+    assert kwargs.get('x') is None
+    assert kwargs.get('validation_data') is None
+
+    state_file_path = make_k_fold_file_name(f'{comp_dir}/{stem}')
+    current_fold = 0
+    histories = []
+
+    # Restore the state of the k-fold cross validation from file, if the file is available
+    if Path(state_file_path).is_file():
+        with open(state_file_path, 'br') as pickle_f:
+            pickled = pickle.load(pickle_f)
+        current_fold = pickled['fold'] + 1
+        histories = pickled['histories']
+
+    for fold in range(current_fold, n_folds):
+        train_ds, val_ds = make_datasets_cb(fold, n_folds, **kwargs)
+        kwargs['x'] = train_ds
+        kwargs['validation_data'] = val_ds
+        fold_stem = '{}-fold{:02d}'.format(stem, fold)
+        history = resumable_fit(model=model, comp_dir=comp_dir, stem=fold_stem, compile_cb=compile_cb, **kwargs)
+        histories.append(history.history)
+        # Update the state of the k-fold x-validation as saved in the pickle
+        with open(state_file_path + '.tmp', 'bw') as pickle_f:
+            pickle_this = {'fold': fold, 'histories': histories}
+            pickle.dump(obj=pickle_this, file=pickle_f, protocol=pickle.HIGHEST_PROTOCOL)
+            keep_last_two_files(state_file_path)
+
+    return histories
 
 
 def resumable_fit(model, comp_dir, stem, compile_cb, **kwargs):
@@ -214,19 +262,7 @@ def resumable_fit(model, comp_dir, stem, compile_cb, **kwargs):
         next_epoch = epoch[-1] + 1
         # model = tf.keras.models.load_model(model_fname)
         model, recompile = load_keras_model(model_fname, compile=False)
-        # if recompile:
         compile_cb(model)
-        """trainable = pickled['trainable']
-        ''' After the model has been loaded, all its layers are trainable by default. If there is at least one layer
-        that should not be trainable (as indicated in `trainable`) then go through every layer of the model and set its 
-        `trainable` attribute as needed '''
-        total_trainable = reduce(lambda partial_sum, item: partial_sum + item[1], trainable, 0)
-        if total_trainable < len(trainable):
-            ''' If any layer is set to not trainable, then the model must be compiled again, to apply the changes; make
-            sure then that there is a callback to recompile the model '''
-            assert compile_cb is not None
-            set_trainable_states(model.layers, trainable)
-            compile_cb(model)"""
         prev_history = tf.keras.callbacks.History()
         prev_history.history = pickled['history']
         prev_history.model = model
@@ -466,9 +502,9 @@ class Trainer():
 
 
 ''' TODO
+Integrate datasets for k-fold (experiments2.py) in the k-fold x-validation 
+Check that re-using callbacks between folds and/or trials doesn't mess them up
 Integrate with the X-ray classification
+Document properly
 Try fancy/cyclic learning rates
-
-Add proper initialization of bias in last layer
-Check class balancing
 '''

@@ -42,9 +42,10 @@
 import os
 import matplotlib.pyplot as plt
 import tensorflow as tf
-from keras_utils import resumable_fit, Trainer, EWA_LearningRateScheduler, count_weights
+from keras_utils import resumable_fit, Trainer, EWA_LearningRateScheduler, count_weights, k_fold_resumable_fit
 from tensorflow.keras.preprocessing import image_dataset_from_directory
 import numpy as np
+from pathlib import Path
 from hyperopt import tpe, hp
 
 """
@@ -86,6 +87,9 @@ def make_train_dataset_cb(**params):
                                                  batch_size=batch_size,
                                                  image_size=IMG_SIZE)
 
+    dataset_size = len(list(Path(train_dir).glob('**/*.jpg')))
+    train_dataset = train_dataset.cache()
+    train_dataset = train_dataset.shuffle(buffer_size=dataset_size, seed=42, reshuffle_each_iteration=True)
     train_dataset = train_dataset.prefetch(buffer_size=AUTOTUNE)
     del (params['batch_size'])
 
@@ -297,15 +301,12 @@ The 2.5M parameters in MobileNet are frozen, but there are 1.2K _trainable_ para
 divided between two `tf.Variable` objects, the weights and biases.
 """
 
-print(len(model.trainable_variables))
-
-
 """
 ### Train the model
 After training for 10 epochs, you should see ~94% accuracy on the validation set.
 """
 
-initial_epochs = 15
+initial_epochs = 10
 
 loss0, accuracy0 = model.evaluate(validation_dataset)
 
@@ -316,6 +317,16 @@ tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir='./logs/transfer_learnin
                                                 histogram_freq=1,
                                                 profile_batch=(2, 5))
 
+"""checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(filepath='./kfold_compstate/transfer_learning_best.h5',
+                                                   monitor='val_accuracy',
+                                                   verbose=1,
+                                                   save_best_only=True,
+                                                   save_weights_only=False,
+                                                   mode='auto',
+                                                   save_freq='epoch')"""
+
+learning_rate_cb = EWA_LearningRateScheduler(verbose=1)
+
 checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(filepath='./comp_state/transfer_learning_best.h5',
                                                    monitor='val_accuracy',
                                                    verbose=1,
@@ -323,8 +334,6 @@ checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(filepath='./comp_state/transf
                                                    save_weights_only=False,
                                                    mode='auto',
                                                    save_freq='epoch')
-
-learning_rate_cb = EWA_LearningRateScheduler(verbose=1)
 
 train_batch_sizes = [16, 32, 64]
 
@@ -469,8 +478,6 @@ learning rate at this stage. Otherwise, your model could overfit very quickly.
 """
 
 
-
-
 def compile_fine_cb(model):
     model.compile(optimizer=tf.keras.optimizers.RMSprop(lr=base_learning_rate / 10),
                   loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
@@ -485,7 +492,7 @@ model.summary()
 If you trained to convergence earlier, this step will improve your accuracy by a few percentage points.
 """
 
-fine_tune_epochs = 20
+fine_tune_epochs = 10
 total_epochs = initial_epochs + fine_tune_epochs
 
 checkpoint_cb_fine = tf.keras.callbacks.ModelCheckpoint(filepath='./comp_state/fine_best.h5',
@@ -545,7 +552,7 @@ trainer_fine = Trainer(model=model,
                        make_train_dataset_cb=make_train_dataset_cb)
 # Note: if `space` only contains constants, no random variables to sample, then `res` here below will be {}
 # logger.info('Starting experiments 2')
-res = trainer_fine.do_it(max_evals=20, algo=tpe.suggest, show_progressbar=False, rstate=np.random.RandomState(seed))
+res = trainer_fine.do_it(max_evals=10, algo=tpe.suggest, show_progressbar=False, rstate=np.random.RandomState(seed))
 print(res)
 
 """
@@ -575,6 +582,68 @@ val_acc += best_trial_history['val_accuracy']
 
 loss += best_trial_history['loss']
 val_loss += best_trial_history['val_loss']
+
+
+
+model = tf.keras.models.load_model(best_pretrained)
+compile_cb(model)
+
+
+
+def make_datasets_cb(fold, n_folds, **kwargs):
+    dataset1 = image_dataset_from_directory(train_dir,
+                                                 shuffle=True,
+                                                 batch_size=64,
+                                                 image_size=IMG_SIZE)
+    dataset1_size = len(list(Path(train_dir).glob('**/*.jpg')))
+
+    dataset2 = image_dataset_from_directory(validation_dir,
+                                            shuffle=True,
+                                            batch_size=64,
+                                            image_size=IMG_SIZE)
+    dataset2_size = len(list(Path(validation_dir).glob('**/*.jpg')))
+    dataset_size = dataset1_size + dataset2_size
+
+    dataset = dataset1.concatenate(dataset2)
+    dataset = dataset.unbatch()
+    dataset = dataset.cache()
+    dataset = dataset.shuffle( dataset_size, seed=42, reshuffle_each_iteration=False)
+
+
+    fold_size = (dataset_size) // n_folds
+    batch_size = kwargs['batch_size']
+
+    val_ds = dataset.skip(fold_size * fold)
+    val_ds = val_ds.take(fold_size)
+    val_ds = val_ds.batch(batch_size=batch_size, drop_remainder=False)
+    val_ds = val_ds.prefetch(buffer_size=tf.data.AUTOTUNE)
+    train_ds1 = dataset.take(fold_size * fold)
+    train_ds2 = dataset.skip(fold_size * (fold + 1))
+    train_ds2 = train_ds2.take(-1)
+    train_ds = train_ds1.concatenate(train_ds2)
+    train_ds = train_ds.shuffle(buffer_size=dataset_size, seed=43, reshuffle_each_iteration=True)
+    train_ds = train_ds.batch(batch_size=batch_size, drop_remainder=False)
+    train_ds = train_ds.prefetch(buffer_size=tf.data.AUTOTUNE)
+
+    return train_ds, val_ds
+
+
+# train_ds, val_ds = make_datasets_cb(1, 10, batch_size=32)
+
+tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir='./logs/kfold',
+                                                histogram_freq=1,
+                                                profile_batch=(2, 5))
+
+learning_rate_cb = EWA_LearningRateScheduler(alpha = base_learning_rate/10, decay=.97, k=3.906134626287861)
+histories = k_fold_resumable_fit(model=model,
+                                 comp_dir='./kfold_compstate',
+                                 stem='transfer_learning',
+                                 compile_cb=compile_cb,
+                                 make_datasets_cb=make_datasets_cb,
+                                 n_folds=5,
+                                 epochs=initial_epochs,
+                                 batch_size=train_batch_sizes[0],
+                                 callbacks=[tensorboard_cb, learning_rate_cb])
 
 plt.figure(figsize=(8, 8))
 plt.subplot(2, 1, 1)
@@ -644,4 +713,8 @@ This technique is usually recommended when the training dataset is large and ver
 that the pre-trained model was trained on.
 
 To learn more, visit the [Transfer learning guide](https://www.tensorflow.org/guide/keras/transfer_learning).
+"""
+
+""" TODO
+Extract the test set from the x-validation dev set, make sure it is not used in training any model
 """
