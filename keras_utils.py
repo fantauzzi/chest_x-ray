@@ -169,7 +169,7 @@ def make_k_fold_file_name(stem):
 
 
 def k_fold_resumable_fit(model, comp_dir, stem, compile_cb, make_datasets_cb, n_folds, log_level=logging.INFO,
-                         **kwargs):
+                         log_dir=None, **kwargs):
     """
 
     :param model:
@@ -210,6 +210,10 @@ def k_fold_resumable_fit(model, comp_dir, stem, compile_cb, make_datasets_cb, n_
         kwargs['validation_data'] = val_ds
         fold_stem = '{}-fold{:02d}'.format(stem, fold)
         logger.info(f'Processing fold {fold} - Total folds to be processed: {n_folds}')
+        callbacks = kwargs.get('callbacks', [])
+        for cb in callbacks:
+            if isinstance(cb, tf.keras.callbacks.TensorBoard) and log_dir is not  None:
+                cb.log_dir = log_dir + '-fold{:02d}'.format(fold)
         history = resumable_fit(model=model, comp_dir=comp_dir, stem=fold_stem, compile_cb=compile_cb, **kwargs)
         histories.append(history.history)
         # Update the state of the k-fold x-validation as saved in the pickle
@@ -219,6 +223,17 @@ def k_fold_resumable_fit(model, comp_dir, stem, compile_cb, make_datasets_cb, n_
             keep_last_two_files(state_file_path)
 
     logger.info(f"All {n_folds} folds of the cross-validation have been processed")
+    histories_df = None
+    for i, history in enumerate(histories):
+        if histories_df is None:
+            histories_df = pd.DataFrame(history)
+            histories_df['fold'] = i
+            histories_df['epoch'] = histories_df.index
+        else:
+            history_df = pd.DataFrame(history)
+            history_df['fold'] = i
+            history_df['epoch'] = history_df.index
+            histories_df = pd.concat([histories_df, history_df], ignore_index=True)
     return histories
 
 

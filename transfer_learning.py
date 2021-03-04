@@ -589,20 +589,19 @@ compile_cb(model)
 
 def make_datasets_cb(fold, n_folds, **kwargs):
     dataset1 = image_dataset_from_directory(train_dir,
-                                            shuffle=True,
+                                            shuffle=False,
                                             batch_size=BATCH_SIZE,
                                             image_size=IMG_SIZE)
     dataset1_size = len(list(Path(train_dir).glob('**/*.jpg')))
 
     dataset2 = image_dataset_from_directory(validation_dir,
-                                            shuffle=True,
+                                            shuffle=False,
                                             batch_size=BATCH_SIZE,
                                             image_size=IMG_SIZE)
     dataset2_size = len(list(Path(validation_dir).glob('**/*.jpg')))
-    dataset2 = dataset2.skip(dataset2_size // 5)  # Skip the part of the validation dataset that is used for testing
+    dataset2 = dataset2.skip(int(np.ceil(dataset2_size/BATCH_SIZE)) // 5)  # Skip the part of the validation dataset that is used for testing
 
     dataset_size = dataset1_size + dataset2_size - dataset2_size // 5
-
     dataset = dataset1.concatenate(dataset2)
     dataset = dataset.unbatch()
     dataset = dataset.cache()
@@ -641,7 +640,10 @@ histories = k_fold_resumable_fit(model=model,
                                  n_folds=5,
                                  epochs=initial_epochs,
                                  batch_size=train_batch_sizes[0],
-                                 callbacks=[tensorboard_cb, learning_rate_cb])
+                                 callbacks=[tensorboard_cb, learning_rate_cb],
+                                 log_dir='./logs/kfold')
+
+
 
 plt.figure(figsize=(8, 8))
 plt.subplot(2, 1, 1)
