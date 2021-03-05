@@ -65,6 +65,7 @@ validation_dir = os.path.join(PATH, 'validation')
 BATCH_SIZE = 32
 IMG_SIZE = (160, 160)
 seed = 42
+test_set_fraction = 3
 
 validation_dataset = image_dataset_from_directory(validation_dir,
                                                   shuffle=True,
@@ -113,8 +114,8 @@ As the original dataset doesn't contains a test set, you will create one. To do 
 """
 
 val_batches = tf.data.experimental.cardinality(validation_dataset)
-test_dataset = validation_dataset.take(val_batches // 5)
-validation_dataset = validation_dataset.skip(val_batches // 5)
+test_dataset = validation_dataset.take(val_batches // test_set_fraction)
+validation_dataset = validation_dataset.skip(val_batches // test_set_fraction)
 
 print('Number of validation batches: %d' % tf.data.experimental.cardinality(validation_dataset))
 print('Number of test batches: %d' % tf.data.experimental.cardinality(test_dataset))
@@ -315,7 +316,7 @@ print("initial accuracy: {:.2f}".format(accuracy0))
 
 tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir='./logs/transfer_learning',
                                                 histogram_freq=1,
-                                                profile_batch=(2, 5))
+                                                profile_batch=0)
 
 """checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(filepath='./kfold_compstate/transfer_learning_best.h5',
                                                    monitor='val_accuracy',
@@ -492,7 +493,7 @@ model.summary()
 If you trained to convergence earlier, this step will improve your accuracy by a few percentage points.
 """
 
-fine_tune_epochs = 10
+fine_tune_epochs = 20
 total_epochs = initial_epochs + fine_tune_epochs
 
 checkpoint_cb_fine = tf.keras.callbacks.ModelCheckpoint(filepath='./comp_state/fine_best.h5',
@@ -517,7 +518,7 @@ history_fine = resumable_fit(model=model,
 
 tensorboard_fine_cb = tf.keras.callbacks.TensorBoard(log_dir='./logs/fine',
                                                      histogram_freq=1,
-                                                     profile_batch=(2, 5))
+                                                     profile_batch=0)
 
 # train_dataset, _ = make_train_dataset_cb(batch_size=BATCH_SIZE)
 
@@ -552,7 +553,7 @@ trainer_fine = Trainer(model=model,
                        make_train_dataset_cb=make_train_dataset_cb)
 # Note: if `space` only contains constants, no random variables to sample, then `res` here below will be {}
 # logger.info('Starting experiments 2')
-res = trainer_fine.do_it(max_evals=10, algo=tpe.suggest, show_progressbar=False, rstate=np.random.RandomState(seed))
+res = trainer_fine.do_it(max_evals=20, algo=tpe.suggest, show_progressbar=False, rstate=np.random.RandomState(seed))
 print(res)
 
 """
@@ -584,7 +585,9 @@ loss += best_trial_history['loss']
 val_loss += best_trial_history['val_loss']
 
 model = tf.keras.models.load_model(best_pretrained)
-compile_cb(model)
+
+
+# No need to compile the model, as k_fold_resumable_fit() will take care of it
 
 
 def make_datasets_cb(fold, n_folds, **kwargs):
@@ -599,9 +602,11 @@ def make_datasets_cb(fold, n_folds, **kwargs):
                                             batch_size=BATCH_SIZE,
                                             image_size=IMG_SIZE)
     dataset2_size = len(list(Path(validation_dir).glob('**/*.jpg')))
-    dataset2 = dataset2.skip(int(np.ceil(dataset2_size/BATCH_SIZE)) // 5)  # Skip the part of the validation dataset that is used for testing
+    dataset2 = dataset2.skip(int(
+        np.ceil(
+            dataset2_size / BATCH_SIZE)) // test_set_fraction)  # Skip the part of the validation dataset that is used for testing
 
-    dataset_size = dataset1_size + dataset2_size - dataset2_size // 5
+    dataset_size = dataset1_size + dataset2_size - dataset2_size // test_set_fraction
     dataset = dataset1.concatenate(dataset2)
     dataset = dataset.unbatch()
     dataset = dataset.cache()
@@ -625,25 +630,73 @@ def make_datasets_cb(fold, n_folds, **kwargs):
     return train_ds, val_ds
 
 
-# train_ds, val_ds = make_datasets_cb(1, 10, batch_size=32)
-
 tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir='./logs/kfold',
                                                 histogram_freq=1,
-                                                profile_batch=(2, 5))
+                                                profile_batch=0)
 
 learning_rate_cb = EWA_LearningRateScheduler(alpha=base_learning_rate / 10, decay=.97, k=3.906134626287861)
-histories = k_fold_resumable_fit(model=model,
-                                 comp_dir='./kfold_compstate',
-                                 stem='transfer_learning',
-                                 compile_cb=compile_cb,
-                                 make_datasets_cb=make_datasets_cb,
-                                 n_folds=5,
-                                 epochs=initial_epochs,
-                                 batch_size=train_batch_sizes[0],
-                                 callbacks=[tensorboard_cb, learning_rate_cb],
-                                 log_dir='./logs/kfold')
+
+histories, means = k_fold_resumable_fit(model=model,
+                                        comp_dir='./kfold_compstate',
+                                        stem='transfer_learning',
+                                        compile_cb=compile_cb,
+                                        make_datasets_cb=make_datasets_cb,
+                                        n_folds=10,
+                                        epochs=fine_tune_epochs,
+                                        batch_size=train_batch_sizes[0],
+                                        callbacks=[tensorboard_cb, learning_rate_cb],
+                                        log_dir='./logs/kfold')
+
+# No need to compile the model, as k_fold_resumable_fit() will take care of it
+model = tf.keras.models.load_model(best_pretrained)
 
 
+def make_dev_dataset(**kwargs):
+    assert kwargs.get('x') is None
+    batch_size = kwargs['batch_size']
+    dataset1 = image_dataset_from_directory(train_dir,
+                                            shuffle=False,
+                                            batch_size=BATCH_SIZE,
+                                            image_size=IMG_SIZE)
+    dataset1_size = len(list(Path(train_dir).glob('**/*.jpg')))
+
+    dataset2 = image_dataset_from_directory(validation_dir,
+                                            shuffle=False,
+                                            batch_size=BATCH_SIZE,
+                                            image_size=IMG_SIZE)
+    dataset2_size = len(list(Path(validation_dir).glob('**/*.jpg')))
+    dataset2 = dataset2.skip(int(
+        np.ceil(
+            dataset2_size / BATCH_SIZE)) // test_set_fraction)  # Skip the part of the validation dataset that is used for testing
+
+    dataset_size = dataset1_size + dataset2_size - dataset2_size // test_set_fraction
+    dataset = dataset1.concatenate(dataset2)
+    dataset = dataset.unbatch()
+    dataset = dataset.cache()
+    dataset = dataset.shuffle(dataset_size, seed=42, reshuffle_each_iteration=False)
+    dataset = dataset.batch(batch_size=batch_size, drop_remainder=False)
+    dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+    return dataset
+
+
+dev_dataset = make_dev_dataset(batch_size=train_batch_sizes[0])
+
+
+tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir='./logs/final',
+                                                histogram_freq=1,
+                                                profile_batch=0)
+
+history_dev = resumable_fit(model=model,
+                             comp_dir='./final_comp_state',
+                             stem='final',
+                             compile_cb=compile_fine_cb,
+                             x=dev_dataset,
+                             epochs=fine_tune_epochs,
+                             initial_epoch=initial_epochs,
+                             validation_data=None,
+                             callbacks=[tensorboard_cb, learning_rate_cb])
+
+print(history_dev.history)
 
 plt.figure(figsize=(8, 8))
 plt.subplot(2, 1, 1)

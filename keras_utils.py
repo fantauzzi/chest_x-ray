@@ -168,8 +168,8 @@ def make_k_fold_file_name(stem):
     return fname
 
 
-def k_fold_resumable_fit(model, comp_dir, stem, compile_cb, make_datasets_cb, n_folds, log_level=logging.INFO,
-                         log_dir=None, **kwargs):
+def k_fold_resumable_fit(model, comp_dir, stem, compile_cb, make_datasets_cb, n_folds, log_dir, log_level=logging.INFO,
+                         **kwargs):
     """
 
     :param model:
@@ -204,7 +204,19 @@ def k_fold_resumable_fit(model, comp_dir, stem, compile_cb, make_datasets_cb, n_
     else:
         logger.info(f"State of k-fold cross validation will be saved in {state_file_path}")
 
+    saved_model_fname = f'{comp_dir}/{stem}_orig.h5'
+
     for fold in range(current_fold, n_folds):
+        if fold == 0:  # TODO move in common subroutine, to be shared with resumable_fit_wrapper()
+            logger.info(
+                f'Starting/resuming cross-validation of fold 0, saving model {model.name} at beginning of computation in {saved_model_fname}')
+            compile_cb(model)
+            save_keras_model(model, filepath=saved_model_fname, save_format='h5')
+        else:
+            logger.info(f'Starting/resuming cross-validation of fold {fold}, reloading model from {saved_model_fname}')
+            model, _ = load_keras_model(saved_model_fname, compile=False)
+            compile_cb(model)
+
         train_ds, val_ds = make_datasets_cb(fold, n_folds, **kwargs)
         kwargs['x'] = train_ds
         kwargs['validation_data'] = val_ds
@@ -212,7 +224,7 @@ def k_fold_resumable_fit(model, comp_dir, stem, compile_cb, make_datasets_cb, n_
         logger.info(f'Processing fold {fold} - Total folds to be processed: {n_folds}')
         callbacks = kwargs.get('callbacks', [])
         for cb in callbacks:
-            if isinstance(cb, tf.keras.callbacks.TensorBoard) and log_dir is not  None:
+            if isinstance(cb, tf.keras.callbacks.TensorBoard) and log_dir is not None:
                 cb.log_dir = log_dir + '-fold{:02d}'.format(fold)
         history = resumable_fit(model=model, comp_dir=comp_dir, stem=fold_stem, compile_cb=compile_cb, **kwargs)
         histories.append(history.history)
@@ -234,7 +246,26 @@ def k_fold_resumable_fit(model, comp_dir, stem, compile_cb, make_datasets_cb, n_
             history_df['fold'] = i
             history_df['epoch'] = history_df.index
             histories_df = pd.concat([histories_df, history_df], ignore_index=True)
-    return histories
+
+    means = histories_df.groupby(['epoch']).mean()
+    to_be_dropped = ['fold', 'lr']
+    for column in means.columns:
+        if str(column)[:4] != 'val_':
+            to_be_dropped.append(column)
+    means.drop(labels=to_be_dropped, axis=1, inplace=True)
+    means['epoch'] = means.index
+
+    file_writer = tf.summary.create_file_writer(log_dir + '-xval')
+    # TODO do I need to set the default below?
+    # file_writer.set_as_default()
+    for column in means.columns:
+        for epoch, data in zip(means['epoch'], means[column]):
+            tf.summary.scalar(str(column),
+                              data=data,
+                              step=epoch,
+                              description='Average of validation metrics across folds during k-fold cross validation.')
+
+    return histories, means
 
 
 def resumable_fit(model, comp_dir, stem, compile_cb, **kwargs):
@@ -261,7 +292,7 @@ def resumable_fit(model, comp_dir, stem, compile_cb, **kwargs):
     prev_history = None
 
     # Prepare the call-backs necessary to checkpoint the computation at the end of every epoch
-    checkpoint_cb = CheckpointEpoch(comp_dir=comp_dir,
+    checkpoint_cb = CheckpointEpoch(comp_dir=comp_dir,  # TODO il looks like here prev_history is always None
                                     stem=stem,
                                     history=prev_history.history if prev_history is not None else None)
     callbacks = list(
@@ -539,6 +570,9 @@ class Trainer():
 
 
 ''' TODO
+Document the whole minestrone
+Add INFO logging messages to the resumable_fit()
+Make sure k-fold and final training use the proper hyperparameters (as opposed to hard-wired values)
 Check that re-using callbacks between folds and/or trials doesn't mess them up
 re-train the final model and test it
 correct log dir for k-fold x-validation
