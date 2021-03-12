@@ -30,6 +30,13 @@ class EWA_LearningRateScheduler(tf.keras.callbacks.LearningRateScheduler):
 
 
 def collect_trainable_states(layers):
+    """
+    Returns a list with the trainable state for all the given layers that have a trainable state. In case the
+    layers have nested layers, then their states appear in the list as explored in pre-order traversal.
+    :param layers: the given layers, a sequence. E.g. it could be attribute `layers` of an instance of `tf.keras.Model`.
+    :return: a list of 2-tuples; the first element in every tuple is the name of the layer, the second element its
+    trainable state. Note that layer names may not be unique.
+    """
     res = []
     for layer in layers:
         if hasattr(layer, 'trainable'):
@@ -41,6 +48,16 @@ def collect_trainable_states(layers):
 
 
 def set_trainable_states(layers, names_and_state, idx=0):
+    """
+    Configure layers to have a given trainable state, as previously returned by `collect_trainable_state()`.
+    :param layers: a sequence of layers the state must be applied to. E.g. it could be attribute `layers` of an
+    instance of `tf.keras.Model`; in that case, after calling the function, the model should be compiled before
+    optimizing it.
+    :param names_and_state: a sequence of tuples as returned by `collect_trainable_state()`.
+    :param idx: the parameter is used internally for recursion, traversing layers of layers; leave it to the default
+    value (or set it to 0) when calling the function.
+    :return: the number of layers to which a trainable state was applied (total of trainable and untrainable layers).
+    """
     for layer in layers:
         if hasattr(layer, 'trainable'):
             name, layer.trainable = names_and_state[idx]
@@ -51,12 +68,24 @@ def set_trainable_states(layers, names_and_state, idx=0):
     return idx
 
 
-def count_components(variables):
-    res = sum([np.prod(variable.shape) for variable in variables])
+def count_components(tensors):
+    """
+    Returns the total number of components in a sequence of Tensorflow tensors. E.g. if a tensor has shape (3,2,1),
+    its components are 3x2x1=6.
+    :param tensors: the given sequence of tensors.
+    :return: the number of components summed across all the tensors in the given sequence.
+    """
+    res = sum([np.prod(variable.shape) for variable in tensors])
     return res
 
 
 def count_weights(layer_or_model):
+    """
+    Returns the count of trainable, non-trainable and total weights in a given model or layer. The count also includes
+    all nested layers, if any.
+    :param layer_or_model: a Keras layer or model.
+    :return: a 3-tuple, with respectively the count of trainable, non-trainable and total weights.
+    """
     trainables_weights, non_trainable_weights, total_weights = 0, 0, 0
     if hasattr(layer_or_model, 'trainable_weights'):
         trainables_weights += count_components(layer_or_model.trainable_weights)
@@ -87,6 +116,14 @@ def make_pickle_file_name(filepath):
 
 def save_keras_model(model, filepath, overwrite=True, include_optimizer=True, save_format=None,
                      signatures=None, options=None, save_traces=True):
+    """
+    Save a Keras model and the trainability state of each of its layers in two separate files. The former is
+    saved through a call to
+    [tf.keras.models.save_model](https://www.tensorflow.org/api_docs/python/tf/keras/models/save_model), see its
+    parameters documentation. The trainability state is saved in a Python pickled file, with name obtained
+    replacing the extension of the given `filepath` with '.pickle' (e.g. './my_model.h5' becomes './my_model.pickle').
+    The model can then be reloaded, along with the saved trainability states, calling `load_keras_model()`.
+    """
     pickle_fname = make_pickle_file_name(filepath)
     trainable = collect_trainable_states(model.layers)
     tf.keras.models.save_model(model, filepath, overwrite, include_optimizer, save_format, signatures, options,
@@ -96,6 +133,17 @@ def save_keras_model(model, filepath, overwrite=True, include_optimizer=True, sa
 
 
 def load_keras_model(filepath, custom_objects=None, compile=True, options=None):
+    """
+    Load a Keras model previously saved via `save_keras_model()`. It loads the model by calling
+    [tf.keras.models.load_model()](https://www.tensorflow.org/api_docs/python/tf/keras/models/load_model), see its
+    parameters documentation. It also loads, and applies to the model, the trainability state for each model layer.
+    If any layer is non-trainable, then the model needs to be compiled after it is returned by the function, even if
+    parameter `compile` was set to True. That's because the trainability state are applied to the model after the call
+    to `tf.keras.models.load_model()`.
+    :return: a 2-tuple; the first item in the tuple is the Keras model, the second item is a boolean, True if at least
+    one layer in the model is set to non-trainable, False otherwise. If the second item is True, then the model should
+    be compiled before being optimized, even if parameter `compile` was set to True.
+    """
     pickle_fname = make_pickle_file_name(filepath)
     model = tf.keras.models.load_model(filepath, custom_objects, compile, options)
     with open(pickle_fname, 'rb') as pickle_f:
@@ -111,6 +159,10 @@ def load_keras_model(filepath, custom_objects=None, compile=True, options=None):
 
 
 class CheckpointEpoch(tf.keras.callbacks.Callback):
+    """
+    Callback that saves the state of the computation at the
+    """
+
     def __init__(self, comp_dir, stem, history):
         super(CheckpointEpoch, self).__init__()
         self.comp_dir = comp_dir
@@ -125,8 +177,12 @@ class CheckpointEpoch(tf.keras.callbacks.Callback):
         self.epochs_in_history = 0 if not self.history else len(next(iter(self.history.values())))
         self.model_checkpoint_cb = None
 
-    def save_checkpoint(self, epoch, logs):
-        # Pickle variables that are needed to restore the computation but are not saved in a .h5 file
+    def save_checkpoint(self):
+        """
+        Save the state of the computation in files, such that the computation can be resumed from that state.
+        """
+        ''' Some of the variables needed to restore the computation are not saved in a .h5 file; pickle them in a 
+        separate file '''
         updated_history = {}
         for k, v in self.model.history.history.items():
             updated_history[k] = self.history.get(k, []) + self.model.history.history[k]
@@ -149,13 +205,23 @@ class CheckpointEpoch(tf.keras.callbacks.Callback):
         Path(self.comp_dir).mkdir(parents=True, exist_ok=True)
 
     def on_epoch_begin(self, epoch, logs=None):
+        """
+        At the beginning of every epoch, except epoch 0, save the state of the computation as it was at the end of the
+        previous epoch. This cannot be done conveniently in on_epoch_end() because, at that time, some information
+        about the computation history in self.model.history.epoch has not been updated yet. State after the end of the
+        last epoch of the computation will be saved by on_train_end()
+        """
         if self.model.history.epoch:
             # Save a checkpoint with the previous epoch (the last epoch that completed)
-            self.save_checkpoint(epoch=epoch - 1, logs=logs)
+            self.save_checkpoint()
 
     def on_train_end(self, logs=None):
-        # Save a checkpoint with the last epoch
-        self.save_checkpoint(epoch=len(self.model.history.epoch) + self.epochs_in_history - 1, logs=logs)
+        """
+        Save the state of the computation at the end of its last epoch, and remove temporary files that are not needed
+        anymore.
+        """
+        # Save a checkpoint with the last epoch of the training
+        self.save_checkpoint()
         # Remove the .prev files of the computation, not needed anymore
         Path(self.prev_model_fname).unlink(missing_ok=True)
         pickle_filepath = make_pickle_file_name(self.prev_model_fname)
@@ -164,6 +230,11 @@ class CheckpointEpoch(tf.keras.callbacks.Callback):
 
 
 def make_k_fold_file_name(stem):
+    """
+    Returns the pickle file name for a given stem.
+    :param stem: the given stem, a string.
+    :return: the pickle file name.
+    """
     fname = stem + '_kfold.pickle'
     return fname
 
@@ -171,18 +242,31 @@ def make_k_fold_file_name(stem):
 def k_fold_resumable_fit(model, comp_dir, stem, compile_cb, make_datasets_cb, n_folds, log_dir, log_level=logging.INFO,
                          **kwargs):
     """
+    Performs k-fold cross validation of a Keras model, training and validating the model k times. The dataset
+    partitioning in k folds is the responsibility of the client code, to be performed in a callback passed to the
+    function, see parameter `make_datasets_cb`.
 
-    :param model:
-    :param comp_dir:
-    :param stem:
-    :param compile_cb:
-    :param make_datasets_cb: a function or method that instantiates the training and, optionally, validation pipelines.
+    :param model: the Keras model. In doesn't need to be compiled, as the function will take care of it. If a previous
+    training and validation process on the same model has been interrupted, but its state was saved in files, then the
+    function will load the model from files and resume training and validation, and this parameter will be ignored,
+     it can be set to None.
+    :param comp_dir: path to the directory where the training state will be saved, a string.
+    :param stem: a stem that will be used to make file names to save the computation state and its results, a string.
+    :param compile_cb: a function that will be called to build the Keras model as necessary. It must take one
+    argument, which is the model to be compiled; anything it returns is ignored.
+    :param make_datasets_cb: a function or method that instantiates the training and validation pipelines.
     It takes three parameters: the fold number, a non-negative integer, the total number of folds, a positive
-    integer, and **kwargs. It returns two instances of td.data.Dataset, with the training and validation datasets
-    respectively for the given fold number, or one instance and None, if no validation is required.
-    :param n_folds:
-    :param kwargs:
-    :return:
+    integer, and **kwargs, as passed to this function. It must return two instances of td.data.Dataset, with the
+    training and validation datasets respectively for the given fold number.
+    :param n_folds: number of folds (k) required for the k-fold cross-validation.
+    :param log_dir: base name for the directory where to save logs for Tensorboard. Logs for fold XX are saved in
+    <log_dir>-fold<nn>, where <nn> is the fold number. Logs for the overall validation, that is the average of the k
+    validations, are saved in <log_dir>-xval.
+    :param log_level: logging level for this funciton, as defined in package `logging`.
+    :param kwargs: parameters to be passed to resumable_fit() for the training and validation of each fold.
+    :return: a 2-tuple; the first element of the tuple is a list of k History objects, each with a record of the
+    computation on fold k, as returned by tf.Keras.Model.fit(). The second element is a pd.DataFrame with the averages
+    of validation metrics per epoch, averaged across folds.
     """
     assert kwargs.get('x') is None
     assert kwargs.get('validation_data') is None
@@ -269,23 +353,24 @@ def k_fold_resumable_fit(model, comp_dir, stem, compile_cb, make_datasets_cb, n_
 
 
 def resumable_fit(model, comp_dir, stem, compile_cb, **kwargs):
-    '''
-    Trains, and optionally evaluate, a model, saving the training state at the end of every epoch; can resume a
-    previously interrupted training from the end of the last epoch that was completed.
-    :param model: the model to be trained, a Keras model. If a computation has been previously checkpointed,
-    then the model will be loaded from the checkpoints, as needed, and this parameter is ignored, can be set to None.
-    Otherwise, the model has to have been compiled already.
-    :param comp_dir: path to the directory where the training state is checkpointed, and where the trained model is
-    saved, a string.
-    :param stem: a stem that will be used to generate file names to checkpoint the computation and save the results.
-    :param compile_cb: a function that will be called to rebuild the Keras model as necessary. It must take one
-    argument, which is the model to be compiled; anything it returns is ignored. It must be provided when the model
-    has any layer set to non-trainable; otherwise it can be None.
-    :param kwargs: keyword arguments to be passed to tf.Keras.Model.fit().
+    """
+    Trains, and optionally evaluate, a model, saving model and training state in files at the end of every epoch; can
+    resume a previously interrupted training from the end of the last epoch that was completed.
+    :param model: the model to be trained, a Keras model. If a previous training process on the same model has been
+    interrupted, but its state was saved in files, then the function will load the model from files and resume training,
+    and this parameter will be ignored and can be set to None. The function will compile the model, does not require the
+    model to have been compiled already.
+    :param comp_dir: path to the directory where the training state will be saved, a string.
+    :param stem: a stem that will be used to make file names to save the computation state and its results, a string.
+    :param compile_cb: a function that will be called to build the Keras model as necessary. It must take one
+    argument, which is the model to be compiled; anything it returns is ignored.
+    :param kwargs: keyword arguments to be passed to tf.Keras.Model.fit(). If there is a 'callbacks' argument listing
+    an instance of tf.keras.callbacks.ModelCheckpoint, then the state of the latter is also saved and restored at
+    the end of every epoch.
     :return: a History object with a record of the computation, as returned by tf.Keras.Model.fit(). In case of
-    multiple calls to this function, to resume training after it has been interrupted, the History.history attribute
-    contains the concatenation of the result of all the computations.
-    '''
+    multiple calls to this function for the same model, to resume its training after it was interrupted, the
+    History.history attribute contains the concatenation of the result of all the computations.
+    """
     epochs = kwargs.get('epochs', 1)
     var_fname = f'{comp_dir}/{stem}_vars.pickle'
     model_fname = f'{comp_dir}/{stem}_model.h5'
@@ -352,6 +437,12 @@ def resumable_fit(model, comp_dir, stem, compile_cb, **kwargs):
 
 
 def make_logger(name, log_level):
+    """
+    Initializes and return a logger. See https://docs.python.org/3/library/logging.html
+    :param name: the name for the logger, a string.
+    :param log_level: the requested log level, as documented in https://docs.python.org/3/library/logging.html#levels
+    :return: an instance of logging.Logger
+    """
     logger = logging.getLogger(name)
     logger.handlers = []
     logger.setLevel(log_level)
@@ -368,18 +459,12 @@ class Trainer():
                  make_train_dataset_cb=None, log_level=logging.INFO):
         '''
         An object that implements a callback for hp.tfmin(), and provides it with a state
-        Careful with https://github.com/tensorflow/tensorflow/issues/41021
+        Be aware of https://github.com/tensorflow/tensorflow/issues/41021#issuecomment-786715361 TLDR: do not use
+        the same instance of Optimizer to compile the model multiple times, otherwise TF may give an error
+        when trying to save the model in a HDF5 (.h5) file.
         '''
         assert optimization_direction in ('min', 'max')
 
-        """self.logger = logging.getLogger('Trainer')
-        self.logger.handlers = []
-        self.logger.setLevel(log_level)
-        ch = logging.StreamHandler()
-        ch.setLevel(logging.INFO)
-        formatter = logging.Formatter('%(asctime)s - %(name)s: %(levelname)s %(message)s')
-        ch.setFormatter(formatter)
-        self.logger.addHandler(ch)"""
         self.logger = make_logger(name='Trainer', log_level=log_level)
 
         self.max_evals = None
@@ -427,10 +512,9 @@ class Trainer():
             self.compile_cb(self.model)
         trial_stem = self.make_trial_stem(self.stem, self.trial)
         best_model_for_trial_fname = self.comp_dir + '/' + self.make_trial_stem(self.stem, self.trial) + '_best.h5'
-        ''' If there are Keras callbacks to checkpoint the best model and/or save logs for Tensorboard, set the 
-        respective file names such that they contain the current trial number. This will ensure a different file
-        name for every trial.'''
-        ''' Apply parameters from `params` to received callbacks as necessary '''
+        ''' Apply parameters from `params` to received callbacks as necessary. If there are Keras callbacks to 
+        checkpoint the best model and/or save logs for Tensorboard, set the respective file names such that they 
+        contain the current trial number. This will ensure a different file name for every trial.'''
         callbacks = params.get('callbacks')
         if callbacks is not None:
             for cb in callbacks:
@@ -513,14 +597,15 @@ class Trainer():
         return res
 
     def do_it(self, max_evals, **kwargs):
-        '''
-        Runs a given number of optimizations, and optionally validations, optimizing the hyper-parameters.
+        """
+        Runs a given number of model optimizations, and optionally validations, using hyperopt to optimize the
+        hyper-parameters.
         :param max_evals: the number of runs to be used to optimize hyper-parameters, corresponds to parameter max_evals
         of hyperopt.fmin().
         :param kwargs: parameters to be passed to hyperopt.fmin(). They are not allowed to include any of these:
-        fn, space, max_evals, trials, trials_save_file.
+        fn, space, max_evals, trials, trials_save_file; this is because the method needs to fill them itself.
         :return: the return value of hyperopt.fmin(), a dictionary with at least two keys 'status' and 'loss'.
-        '''
+        """
         self.logger.info(f'Requested to run {max_evals} trials, with trials state saved in {self.trials_fname}')
         for k, _ in kwargs.items():
             assert k not in ('fn', 'space', 'max_evals', 'trials', 'trials_save_file')
@@ -570,7 +655,6 @@ class Trainer():
 
 
 ''' TODO
-Document the whole minestrone
 Add INFO logging messages to the resumable_fit()
 Make sure k-fold and final training use the proper hyperparameters (as opposed to hard-wired values)
 Check that re-using callbacks between folds and/or trials doesn't mess them up
@@ -578,6 +662,5 @@ re-train the final model and test it
 correct log dir for k-fold x-validation
 charts and statistics for k-fold x-validation, choice of the final model for inference (and test)
 Integrate with the X-ray classification
-Document properly
 Try fancy/cyclic learning rates
 '''
