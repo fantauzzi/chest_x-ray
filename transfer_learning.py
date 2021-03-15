@@ -273,7 +273,6 @@ inputs = tf.keras.Input(shape=(160, 160, 3))
 x = data_augmentation(inputs)
 x = preprocess_input(x)
 x = base_model(x, training=False)
-# x = base_model(x)
 x = global_average_layer(x)
 x = tf.keras.layers.Dropout(0.2)(x)
 outputs = prediction_layer(x)
@@ -318,14 +317,6 @@ tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir='./logs/transfer_learnin
                                                 histogram_freq=1,
                                                 profile_batch=0)
 
-"""checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(filepath='./kfold_compstate/transfer_learning_best.h5',
-                                                   monitor='val_accuracy',
-                                                   verbose=1,
-                                                   save_best_only=True,
-                                                   save_weights_only=False,
-                                                   mode='auto',
-                                                   save_freq='epoch')"""
-
 learning_rate_cb = EWA_LearningRateScheduler(verbose=1)
 
 checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(filepath='./comp_state/transfer_learning_best.h5',
@@ -347,16 +338,6 @@ hp_space = {  # 'x': train_dataset,
     'decay': .97,
     'k': hp.uniform('k', 2., 6.),
     'callbacks': [tensorboard_cb, checkpoint_cb, learning_rate_cb]}
-# train_batch_size': hp.choice('train_batch_size', train_batch_sizes),
-
-"""hp_space = {'epochs': initial_epochs,
-            'batch_size': BATCH_SIZE,
-            'validation_data': validation_dataset,
-            # 'alpha': hp.loguniform('learning_rate', np.log(1e-4), np.log(1e-3)),
-            'alpha': base_learning_rate,
-            'decay': .97,
-            'k': 2.,
-            'callbacks': [tensorboard_cb, checkpoint_cb, learning_rate_cb]}"""
 
 trainer = Trainer(model=model,
                   compile_cb=compile_cb,
@@ -367,7 +348,7 @@ trainer = Trainer(model=model,
                   optimization_direction='max',
                   log_dir='./logs',
                   make_train_dataset_cb=make_train_dataset_cb)
-# Note: if `space` only contains constants, no random variables to sample, then `res` here below will be {}
+# Note: if `space` only contains constants, no random variables to sample from, then `res` here below will be {}
 res = trainer.do_it(max_evals=10, algo=tpe.suggest, show_progressbar=False, rstate=np.random.RandomState(seed))
 
 best_trial = trainer.trials.best_trial
@@ -388,40 +369,31 @@ Let's take a look at the learning curves of the training and validation accuracy
 model as a fixed feature extractor.
 """
 
-# Re-loading the model from disk is a workaround for the spike in training loss at the first epoch of fine-tuning
-# model = tf.keras.models.load_model('./comp_state/transfer_learning_model.h5')
-# model = tf.keras.models.load_model('./comp_state/transfer_learning_best.h5')
-# model, recompile = load_keras_model(best_pretrained, compile=False)
-
-
-# if compile:
-# compile_fine_cb(model)
 best_trial_history = trainer.trials.best_trial['result']['history']
 acc = best_trial_history['accuracy']
 val_acc = best_trial_history['val_accuracy']
 
 loss = best_trial_history['loss']
 val_loss = best_trial_history['val_loss']
-"""
-plt.figure(figsize=(8, 8))
-plt.subplot(2, 1, 1)
-plt.plot(acc, label='Training Accuracy')
-plt.plot(val_acc, label='Validation Accuracy')
-plt.legend(loc='lower right')
-plt.ylabel('Accuracy')
-plt.ylim([min(plt.ylim()), 1])
-plt.title('Training and Validation Accuracy')
+if False:
+    plt.figure(figsize=(8, 8))
+    plt.subplot(2, 1, 1)
+    plt.plot(acc, label='Training Accuracy')
+    plt.plot(val_acc, label='Validation Accuracy')
+    plt.legend(loc='lower right')
+    plt.ylabel('Accuracy')
+    plt.ylim([min(plt.ylim()), 1])
+    plt.title('Training and Validation Accuracy')
 
-plt.subplot(2, 1, 2)
-plt.plot(loss, label='Training Loss')
-plt.plot(val_loss, label='Validation Loss')
-plt.legend(loc='upper right')
-plt.ylabel('Cross Entropy')
-plt.ylim([0, 1.0])
-plt.title('Training and Validation Loss')
-plt.xlabel('epoch')
-plt.show()
-"""
+    plt.subplot(2, 1, 2)
+    plt.plot(loss, label='Training Loss')
+    plt.plot(val_loss, label='Validation Loss')
+    plt.legend(loc='upper right')
+    plt.ylabel('Cross Entropy')
+    plt.ylim([0, 1.0])
+    plt.title('Training and Validation Loss')
+    plt.xlabel('epoch')
+    plt.show()
 
 """
 Note: If you are wondering why the validation metrics are clearly better than the training metrics, the main factor 
@@ -504,43 +476,18 @@ checkpoint_cb_fine = tf.keras.callbacks.ModelCheckpoint(filepath='./comp_state/f
                                                         mode='auto',
                                                         save_freq='epoch')
 
-"""
-history_fine = resumable_fit(model=model,
-                             comp_dir='./comp_state',
-                             stem='fine',
-                             compile_cb=compile_fine_cb,
-                             x=train_dataset,
-                             epochs=total_epochs,
-                             initial_epoch=initial_epochs,
-                             validation_data=validation_dataset,
-                             callbacks=[tensorboard_cb, checkpoint_cb_fine])
-"""
-
 tensorboard_fine_cb = tf.keras.callbacks.TensorBoard(log_dir='./logs/fine',
                                                      histogram_freq=1,
                                                      profile_batch=0)
 
-# train_dataset, _ = make_train_dataset_cb(batch_size=BATCH_SIZE)
-
-hp_space_fine = {  # 'x': train_dataset,
-    'epochs': fine_tune_epochs,
-    'batch_size': hp.choice('train_batch_size', train_batch_sizes),
-    'validation_data': validation_dataset,
-    # 'alpha': hp.loguniform('learning_rate', np.log(1e-4), np.log(1e-3)),
-    'alpha': base_learning_rate / 10,
-    'decay': .97,
-    'k': hp.uniform('k', 2., 6.),
-    'callbacks': [tensorboard_fine_cb, checkpoint_cb_fine, learning_rate_cb]}
-
-"""hp_space_fine = {  # 'x': train_dataset,
-    'epochs': fine_tune_epochs,
-    'batch_size': BATCH_SIZE,
-    'validation_data': validation_dataset,
-    # 'alpha': hp.loguniform('learning_rate', np.log(1e-4), np.log(1e-3)),
-    'alpha': base_learning_rate / 10,
-    'decay': .97,
-    'k': 2,
-    'callbacks': [tensorboard_fine_cb, checkpoint_cb_fine, learning_rate_cb]}"""
+hp_space_fine = {'epochs': fine_tune_epochs,
+                 'batch_size': hp.choice('train_batch_size', train_batch_sizes),
+                 'validation_data': validation_dataset,
+                 # 'alpha': hp.loguniform('learning_rate', np.log(1e-4), np.log(1e-3)),
+                 'alpha': base_learning_rate / 10,
+                 'decay': .97,
+                 'k': hp.uniform('k', 2., 6.),
+                 'callbacks': [tensorboard_fine_cb, checkpoint_cb_fine, learning_rate_cb]}
 
 trainer_fine = Trainer(model=model,
                        compile_cb=compile_fine_cb,
@@ -552,7 +499,6 @@ trainer_fine = Trainer(model=model,
                        log_dir='./logs',
                        make_train_dataset_cb=make_train_dataset_cb)
 # Note: if `space` only contains constants, no random variables to sample, then `res` here below will be {}
-# logger.info('Starting experiments 2')
 res = trainer_fine.do_it(max_evals=20, algo=tpe.suggest, show_progressbar=False, rstate=np.random.RandomState(seed))
 print(res)
 
@@ -586,6 +532,8 @@ val_loss += best_trial_history['val_loss']
 
 model = tf.keras.models.load_model(best_pretrained)
 
+best_k = res['k']
+best_train_batch_size = train_batch_sizes[res['train_batch_size']]
 
 # No need to compile the model, as k_fold_resumable_fit() will take care of it
 
@@ -634,20 +582,26 @@ tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir='./logs/kfold',
                                                 histogram_freq=1,
                                                 profile_batch=0)
 
-learning_rate_cb = EWA_LearningRateScheduler(alpha=base_learning_rate / 10, decay=.97, k=3.906134626287861)
+learning_rate_cb = EWA_LearningRateScheduler(alpha=base_learning_rate / 10, decay=.97, k=best_k)
+
+def compile_cb(model):
+    model.compile(optimizer=tf.keras.optimizers.Adam(lr=base_learning_rate/10),
+                  loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
+                  metrics=['accuracy'])
+
 
 histories, means = k_fold_resumable_fit(model=model,
                                         comp_dir='./kfold_compstate',
                                         stem='transfer_learning',
                                         compile_cb=compile_cb,
                                         make_datasets_cb=make_datasets_cb,
-                                        n_folds=10,
+                                        n_folds=4,
                                         epochs=fine_tune_epochs,
-                                        batch_size=train_batch_sizes[0],
+                                        batch_size=best_train_batch_size,
                                         callbacks=[tensorboard_cb, learning_rate_cb],
                                         log_dir='./logs/kfold')
 
-# No need to compile the model, as k_fold_resumable_fit() will take care of it
+# No need to compile the model, as resumable_fit() will take care of it
 model = tf.keras.models.load_model(best_pretrained)
 
 
@@ -679,22 +633,23 @@ def make_dev_dataset(**kwargs):
     return dataset
 
 
-dev_dataset = make_dev_dataset(batch_size=train_batch_sizes[0])
-
+dev_dataset = make_dev_dataset(batch_size=best_train_batch_size)
 
 tensorboard_cb = tf.keras.callbacks.TensorBoard(log_dir='./logs/final',
                                                 histogram_freq=1,
                                                 profile_batch=0)
 
+learning_rate_cb = EWA_LearningRateScheduler(alpha=base_learning_rate / 10, decay=.97, k=best_k)
+
 history_dev = resumable_fit(model=model,
-                             comp_dir='./final_comp_state',
-                             stem='final',
-                             compile_cb=compile_fine_cb,
-                             x=dev_dataset,
-                             epochs=fine_tune_epochs,
-                             initial_epoch=initial_epochs,
-                             validation_data=None,
-                             callbacks=[tensorboard_cb, learning_rate_cb])
+                            comp_dir='./final_comp_state',
+                            stem='final',
+                            compile_cb=compile_fine_cb,
+                            x=dev_dataset,
+                            epochs=fine_tune_epochs,
+                            initial_epoch=initial_epochs,
+                            validation_data=None,
+                            callbacks=[tensorboard_cb, learning_rate_cb])
 
 print(history_dev.history)
 

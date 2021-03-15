@@ -341,7 +341,7 @@ def k_fold_resumable_fit(model, comp_dir, stem, compile_cb, make_datasets_cb, n_
 
     file_writer = tf.summary.create_file_writer(log_dir + '-xval')
     # TODO do I need to set the default below?
-    # file_writer.set_as_default()
+    file_writer.set_as_default()
     for column in means.columns:
         for epoch, data in zip(means['epoch'], means[column]):
             tf.summary.scalar(str(column),
@@ -656,11 +656,7 @@ class Trainer():
 
 ''' TODO
 Add INFO logging messages to the resumable_fit()
-Make sure k-fold and final training use the proper hyperparameters (as opposed to hard-wired values)
 Check that re-using callbacks between folds and/or trials doesn't mess them up
-re-train the final model and test it
-correct log dir for k-fold x-validation
-charts and statistics for k-fold x-validation, choice of the final model for inference (and test)
 Integrate with the X-ray classification
 Try fancy/cyclic learning rates
 '''
